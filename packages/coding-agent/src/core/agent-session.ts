@@ -46,13 +46,18 @@ import type {
 import {
 	clampThinkingLevel,
 	cleanupSessionResources,
+	convertResponsesMessages,
 	getSupportedThinkingLevels,
 	isContextOverflow,
 	isRecoverableLength,
 	isRetryableAssistantError,
 	modelsAreEqual,
+	normalizeContext,
+	type ResponsesItemCounts,
 	type RetryCallbacks,
 	resetApiProviders,
+	resolveTranscript,
+	type ServerCompaction,
 	streamSimple,
 } from "@earendil-works/pi-ai/compat";
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
@@ -518,6 +523,7 @@ export class AgentSession {
 		this._installAgentBoundaryHooks();
 		this._installHiddenDeclarationsProjection();
 		this._installAgentForcedPromptProjection();
+		this._installServerCompactionAdoption();
 
 		this._buildRuntime({
 			activeToolNames: this._initialActiveToolNames,
@@ -781,8 +787,195 @@ export class AgentSession {
 		if (!model || isVirtualModel(model) || !this._exceedsCompactionThreshold(model, projection)) {
 			return { ...context, messages: projection.messages };
 		}
+		if (this._serverCompactionActive()) {
+			// The provider compacts this request's context server-side; pi adopts
+			// the summary afterwards. Do not double-compact on the client.
+			return { ...context, messages: projection.messages };
+		}
 		await this._runAutoCompaction("threshold", false);
 		return { ...context, messages: this.sessionManager.buildSessionProjection().messages };
+	}
+
+	/**
+	 * Adopt server-side compaction (Responses API `context_management`) into pi
+	 * session state. The server summarized the compacted prefix for the request
+	 * that just completed; the summary is persisted as a normal compaction entry
+	 * so pi's own context window math and client-side compaction fallback keep
+	 * working. No extra LLM call is made here.
+	 */
+	private _adoptServerCompaction(compaction: ServerCompaction): void {
+		try {
+			if (!compaction.summary || compaction.inputItemCounts === undefined) return;
+			const projection = this.sessionManager.buildSessionProjection();
+			const model = this.agent.state.model;
+			if (!model || !compaction.inputItemCounts.length) return;
+
+			// Rebuild the request's input items exactly as the Responses adapter
+			// did (convertToLlm + resolveTranscript + same compat flags) so the
+			// per-message item counts match, then map the server's item-based cut
+			// point back to a projection message.
+			const compat = model.compat as { supportsMidConvoSystemMessages?: boolean } | undefined;
+			const itemCounter: ResponsesItemCounts = { counts: [] };
+			convertResponsesMessages(
+				model,
+				resolveTranscript(
+					normalizeContext({ messages: convertToLlm(projection.messages) }),
+					compat?.supportsMidConvoSystemMessages,
+				),
+				new Set<string>(),
+				{ supportsMidConvoSystemMessages: compat?.supportsMidConvoSystemMessages },
+				itemCounter,
+			);
+			const counts = itemCounter.counts;
+			if (counts.length !== compaction.inputItemCounts.length) return;
+
+			// Per projection message: which (single) LLM message it produced. Each
+			// AgentMessage maps to at most one LLM message in convertToLlm.
+			const perMessage = projection.messages.map((m) => convertToLlm([m])[0]);
+			// Replay resolveTranscript's collapse and keep the projection index of
+			// every message that survives into the request transcript.
+			const resolvedSource: number[] = [];
+			let sawHeadSystem = false;
+			perMessage.forEach((m, j) => {
+				if (m === undefined) return;
+				if (m.role === "system") {
+					if (compat?.supportsMidConvoSystemMessages === true) resolvedSource.push(j);
+					else if (!sawHeadSystem) {
+						sawHeadSystem = true;
+						resolvedSource.push(j);
+					}
+				} else {
+					resolvedSource.push(j);
+				}
+			});
+
+			// Walk the item counts to find the first RETAINED LLM message (the
+			// server summarized items [0, itemsCompacted)).
+			let itemIndex = 0;
+			let firstKeptResolved: number | null = null;
+			for (let i = 0; i < counts.length && itemIndex < compaction.itemsCompacted; i++) {
+				if (itemIndex + counts[i] > compaction.itemsCompacted) {
+					firstKeptResolved = i;
+					break;
+				}
+				itemIndex += counts[i];
+			}
+			if (firstKeptResolved === null || firstKeptResolved >= resolvedSource.length) {
+				return; // everything was compacted or mapping is off — keep the session as-is
+			}
+			const keptProjectionIndex = resolvedSource[firstKeptResolved];
+			if (keptProjectionIndex <= 0) return; // the system prompt is the first kept message; nothing real compacted
+
+			// Keep the WHOLE ENTRY containing that projection message (pi's
+			// projection only starts at entry boundaries). This may retain a few
+			// more items than the server did — never drops any it kept.
+			let projectedIndex = 0;
+			let firstKeptEntryId: string | null = null;
+			for (const entry of projection.entries) {
+				if (projectedIndex + entry.messages.length > keptProjectionIndex) {
+					firstKeptEntryId = entry.sourceEntry.id;
+					break;
+				}
+				projectedIndex += entry.messages.length;
+			}
+			const branch = this.sessionManager.getBranch();
+			if (!firstKeptEntryId) {
+				firstKeptEntryId = branch.length ? branch[branch.length - 1].id : null;
+			}
+
+			const tokensBefore = estimateProjectedContextTokens(
+				this.sessionManager.buildSessionProjection(),
+				branch,
+			).tokens;
+			const details = {
+				source: "server",
+				compactionItemId: compaction.id,
+				serverInputTokens: compaction.inputTokens,
+				serverItemsCompacted: compaction.itemsCompacted,
+				serverItemsRetained: compaction.itemsRetained,
+			};
+			this.sessionManager.appendCompaction(
+				compaction.summary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
+				true,
+				undefined,
+			);
+			this._refreshFinalizedContext();
+			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
+			const result: CompactionResult = {
+				summary: compaction.summary,
+				firstKeptEntryId: firstKeptEntryId ?? "",
+				tokensBefore,
+				estimatedTokensAfter,
+				details,
+			};
+			this._emit({ type: "compaction_end", reason: "threshold", result, aborted: false, willRetry: false });
+		} catch (_error) {
+			// Adoption is best-effort; pi's own client-side compaction remains the
+			// fallback for the next request. Do not break the running turn.
+			this._emit({
+				type: "compaction_end",
+				reason: "threshold",
+				result: undefined,
+				aborted: true,
+				willRetry: false,
+			});
+		}
+	}
+
+	/**
+	 * Whether the current model opts into server-owned compaction.
+	 */
+	private _modelSupportsServerCompaction(model: Model<any> | undefined): boolean {
+		if (!model || isVirtualModel(model)) return false;
+		return (model.compat as { serverSideCompaction?: boolean } | undefined)?.serverSideCompaction === true;
+	}
+
+	/**
+	 * Prepare the per-request server-compaction state before a conversational
+	 * request: set the `context_management` threshold when the model opts in,
+	 * clear it otherwise.
+	 */
+	private _setServerCompactionRequestState(model: Model<any> | undefined): void {
+		if (this._modelSupportsServerCompaction(model)) {
+			const settings = this.settingsManager.getCompactionSettings(model);
+			const threshold = Math.max(
+				0,
+				((model as { contextWindow?: number }).contextWindow ?? 0) - settings.reserveTokens,
+			);
+			this.agent.contextManagement = { compactThreshold: threshold };
+		} else {
+			this.agent.contextManagement = undefined;
+		}
+	}
+
+	/**
+	 * Whether the provider for the current model is allowed to compact the
+	 * request's context server-side. When true, pi defers its own pre-request
+	 * client-side compaction to the server (which summarizes, keeps the recent
+	 * tail, and reports the compaction item pi adopts afterwards).
+	 */
+	private _serverCompactionActive(): boolean {
+		return this._modelSupportsServerCompaction(this.agent.state.model);
+	}
+
+	/**
+	 * Wire server-side compaction into the agent's stream options. Only fires
+	 * for providers that report a compaction output item (local rukhm
+	 * /v1/responses; OpenAI context_management once it exposes the metadata).
+	 */
+	private _installServerCompactionAdoption(): void {
+		this.agent.onServerCompaction = (compaction: ServerCompaction) => {
+			void (async () => {
+				// The server already compacted the request that just completed; the
+				// summary is persisted so pi's next projection is smaller. Pi's own
+				// client-side compaction remains the fallback (it will simply find
+				// the context below its threshold after adoption).
+				this._adoptServerCompaction(compaction);
+			})().catch(() => {});
+		};
 	}
 
 	private _installAgentRequestProjection(): void {
@@ -812,6 +1005,7 @@ export class AgentSession {
 			let { previous, context, projection } = await prepare();
 			const model = previous?.model ?? this.agent.state.model;
 			const thinkingLevel = previous?.thinkingLevel ?? this.agent.state.thinkingLevel;
+			this._setServerCompactionRequestState(model);
 			if (!isVirtualModel(model)) return { ...previous, context, model, thinkingLevel };
 
 			// The selection stays in agent state; only this request uses the routed model. A routing
@@ -836,10 +1030,14 @@ export class AgentSession {
 			}
 			// The route stands: the router already decided this request. The state entry does not change
 			// the projection.
-			if (this._exceedsCompactionThreshold(route.model, projection)) {
+			if (
+				this._exceedsCompactionThreshold(route.model, projection) &&
+				!this._modelSupportsServerCompaction(route.model)
+			) {
 				await this._runAutoCompaction("threshold", false);
 				({ previous, context } = await prepare());
 			}
+			this._setServerCompactionRequestState(route.model);
 			return { ...previous, context, model: route.model, thinkingLevel: route.thinkingLevel };
 		};
 	}

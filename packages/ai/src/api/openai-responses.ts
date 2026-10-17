@@ -5,6 +5,7 @@ import type {
 	Api,
 	AssistantMessage,
 	CacheRetention,
+	ChatTemplateKwargValue,
 	Model,
 	OpenAIResponsesCompat,
 	ProviderEnv,
@@ -24,9 +25,20 @@ import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { getDeclaredTools, resolveTranscript, resolveTranscriptTools } from "../utils/transcript.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
+import { buildChatTemplateValues } from "./openai-completions.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
-import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
-import { buildBaseOptions, resolveSamplingParams } from "./simple-options.ts";
+import {
+	convertResponsesMessages,
+	convertResponsesTools,
+	processResponsesStream,
+	type ResponsesItemCounts,
+} from "./openai-responses-shared.ts";
+import {
+	buildBaseOptions,
+	clampThinkingBudgetToAnswerRoom,
+	resolveSamplingParams,
+	thinkingBudgetForLevel,
+} from "./simple-options.ts";
 
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
 // OpenAI Responses rejects max_output_tokens below 16: https://github.com/earendil-works/pi/issues/6265
@@ -81,7 +93,16 @@ function resolveCacheRetention(cacheRetention?: CacheRetention, env?: ProviderEn
 	return "short";
 }
 
-function getCompat(model: Model<"openai-responses">): Required<OpenAIResponsesCompat> {
+type ResponsesCompat = Required<OpenAIResponsesCompat> & {
+	// Extra (non-schema) fields used by the local rukhm server: server-owned
+	// compaction via context_management, and chat-template thinking kwargs.
+	serverSideCompaction: boolean;
+	thinkingFormat?: string;
+	chatTemplateKwargs?: Record<string, ChatTemplateKwargValue>;
+};
+
+function getCompat(model: Model<"openai-responses">): ResponsesCompat {
+	const compat = model.compat as Record<string, unknown> | undefined;
 	return {
 		supportsDeveloperRole: model.compat?.supportsDeveloperRole ?? true,
 		supportsMidConvoSystemMessages: model.compat?.supportsMidConvoSystemMessages ?? false,
@@ -94,6 +115,9 @@ function getCompat(model: Model<"openai-responses">): Required<OpenAIResponsesCo
 		supportsExplicitPromptCacheMode: model.compat?.supportsExplicitPromptCacheMode ?? false,
 		supportsMaxOutputTokens: model.compat?.supportsMaxOutputTokens ?? true,
 		supportsMidConvoEffort: model.compat?.supportsMidConvoEffort ?? false,
+		serverSideCompaction: compat?.serverSideCompaction === true,
+		thinkingFormat: compat?.thinkingFormat as string | undefined,
+		chatTemplateKwargs: compat?.chatTemplateKwargs as Record<string, ChatTemplateKwargValue> | undefined,
 	};
 }
 
@@ -139,6 +163,12 @@ export interface OpenAIResponsesOptions extends StreamOptions {
 	reasoningSummary?: "auto" | "detailed" | "concise" | null;
 	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
 	toolChoice?: ResponseCreateParamsStreaming["tool_choice"];
+	/**
+	 * Enable provider-owned compaction (emits `context_management`). The
+	 * provider must support it (compat.serverSideCompaction); see
+	 * `onServerCompaction` for the server's response.
+	 */
+	contextManagement?: { compactThreshold: number };
 }
 
 /**
@@ -192,7 +222,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				options?.fetch,
 				cacheSessionId,
 			);
-			let params = buildParams(
+			const builtParams = buildParams(
 				model,
 				normalizedContext,
 				options,
@@ -200,6 +230,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				grammarToolInputProperties,
 				configurationUpdateEffort,
 			);
+			let params = builtParams.params;
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
 				params = nextParams as ResponseCreateParamsStreaming;
@@ -222,6 +253,8 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 
 			await processResponsesStream(openaiStream, output, stream, model, {
 				onProviderStreamEvent: options?.onProviderStreamEvent,
+				onServerCompaction: options?.onServerCompaction,
+				requestItemCounts: builtParams.itemCounts,
 				serviceTier: options?.serviceTier,
 				grammarToolInputProperties,
 				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
@@ -332,25 +365,35 @@ function buildParams(
 	model: Model<"openai-responses">,
 	context: TranscriptContext,
 	options: OpenAIResponsesOptions | undefined,
-	compat: Required<OpenAIResponsesCompat>,
-	grammarToolInputProperties: ReadonlyMap<string, string>,
-	configurationUpdateEffort: string | undefined,
-) {
+	compat: ResponsesCompat = getCompat(model),
+	grammarToolInputProperties: ReadonlyMap<string, string> = createGrammarToolInputProperties(
+		getDeclaredTools(context.messages),
+		compat.supportsOpenAIGrammarTools,
+	),
+	configurationUpdateEffort: string | undefined = undefined,
+): { params: ResponseCreateParamsStreaming; itemCounts?: number[] } {
 	const transcriptTools = resolveTranscriptTools(
 		context.messages,
 		compat.supportsAdditionalTools || compat.supportsToolSearch,
 	);
-	const messages = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS, {
-		grammarToolInputProperties,
-		supportsMidConvoSystemMessages: compat.supportsMidConvoSystemMessages,
-		supportsAdditionalTools: compat.supportsAdditionalTools,
-		supportsToolSearch: compat.supportsToolSearch,
-		toolOptions: {
-			supportsStrictMode: compat.supportsStrictMode,
-			supportsOpenAIGrammarTools: compat.supportsOpenAIGrammarTools,
+	const itemCounter: ResponsesItemCounts = { counts: [] };
+	const messages = convertResponsesMessages(
+		model,
+		context,
+		OPENAI_TOOL_CALL_PROVIDERS,
+		{
+			grammarToolInputProperties,
+			supportsMidConvoSystemMessages: compat.supportsMidConvoSystemMessages,
+			supportsAdditionalTools: compat.supportsAdditionalTools,
+			supportsToolSearch: compat.supportsToolSearch,
+			toolOptions: {
+				supportsStrictMode: compat.supportsStrictMode,
+				supportsOpenAIGrammarTools: compat.supportsOpenAIGrammarTools,
+			},
+			configurationUpdateEffort,
 		},
-		configurationUpdateEffort,
-	});
+		itemCounter,
+	);
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
 	// Sign in with ChatGPT rejects these request fields.
@@ -389,7 +432,9 @@ function buildParams(
 	}
 
 	const reasoningEffort = options?.reasoningEffort ?? (options?.reasoningSummary ? "medium" : undefined);
-	if (model.reasoning) {
+	// chat-template local servers carry thinking via chat_template_kwargs, not the
+	// Responses `reasoning` field.
+	if (model.reasoning && compat.thinkingFormat !== "chat-template") {
 		if (reasoningEffort) {
 			const requestedEffort = options?.reasoningEffort
 				? (model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort)
@@ -414,7 +459,37 @@ function buildParams(
 		Object.assign(params, samplingParams);
 	}
 
-	return params;
+	// Server-side compaction: the provider owns summarization and returns a
+	// compaction output item when the rendered input crosses the threshold.
+	// Only emitted for providers that opt in via compat.
+	if (compat.serverSideCompaction && typeof options?.contextManagement?.compactThreshold === "number") {
+		params.context_management = [
+			{ type: "compaction", compact_threshold: options.contextManagement.compactThreshold },
+		];
+	}
+
+	// Chat-template thinking (vLLM-style local servers) speaks chat_template_kwargs
+	// on both completions and responses payloads; the Responses `reasoning` field
+	// above would be meaningless to them, so only add it for non-template providers.
+	if (compat.thinkingFormat === "chat-template" && model.reasoning) {
+		const budget = options?.reasoningEffort
+			? clampThinkingBudgetToAnswerRoom(
+					thinkingBudgetForLevel(options.reasoningEffort, options.thinkingBudgets),
+					params.max_output_tokens ?? model.maxTokens,
+				)
+			: undefined;
+		const chatTemplateKwargs = buildChatTemplateValues(
+			model,
+			options,
+			compat.chatTemplateKwargs ?? {},
+			budget && budget > 0 ? budget : undefined,
+		);
+		if (chatTemplateKwargs) {
+			(params as { chat_template_kwargs?: Record<string, unknown> }).chat_template_kwargs = chatTemplateKwargs;
+		}
+	}
+
+	return { params, itemCounts: itemCounter.counts };
 }
 
 function getServiceTierCostMultiplier(

@@ -13,6 +13,7 @@ import type {
 } from "openai/resources/chat/completions.js";
 import { calculateCost, clampThinkingLevel } from "../models.ts";
 import type {
+	Api,
 	AssistantMessage,
 	CacheRetention,
 	ChatTemplateKwargValue,
@@ -30,6 +31,7 @@ import type {
 	TextContent,
 	ThinkingBudgets,
 	ThinkingContent,
+	ThinkingLevel,
 	ThinkingTokenBudgetField,
 	Tool,
 	ToolCall,
@@ -1033,9 +1035,9 @@ function resolveClampedThinkingBudget(
 	return budget > 0 ? budget : undefined;
 }
 
-function buildChatTemplateValues(
-	model: Model<"openai-completions">,
-	options: OpenAICompletionsOptions | undefined,
+export function buildChatTemplateValues(
+	model: Pick<Model<Api>, "thinkingLevelMap">,
+	options: { reasoningEffort?: ThinkingLevel | undefined; thinkingBudgets?: ThinkingBudgets } | undefined,
 	values: Record<string, ChatTemplateKwargValue>,
 	thinkingBudget?: number,
 ): Record<string, ResolvedChatTemplateKwargValue> | undefined {
@@ -1051,9 +1053,9 @@ function buildChatTemplateValues(
 	return Object.keys(resolvedValues).length > 0 ? resolvedValues : undefined;
 }
 
-function resolveChatTemplateKwargValue(
-	model: Model<"openai-completions">,
-	options: OpenAICompletionsOptions | undefined,
+export function resolveChatTemplateKwargValue(
+	model: Pick<Model<Api>, "thinkingLevelMap">,
+	options: { reasoningEffort?: ThinkingLevel | undefined; thinkingBudgets?: ThinkingBudgets } | undefined,
 	value: ChatTemplateKwargValue,
 	thinkingBudget?: number,
 ): ResolvedChatTemplateKwargValue | undefined {

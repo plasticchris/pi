@@ -209,6 +209,32 @@ export interface ProviderRequestOptions<TModel = Model<Api>> {
 	maxRetryDelayMs?: number;
 }
 
+/**
+ * A server-side compaction reported by a Responses-API provider (OpenAI
+ * context_management or the local rukhm /v1/responses endpoint): the server
+ * summarized part of the input for this one request and returned a compaction
+ * output item instead of echoing it. The payload carries enough metadata for
+ * the caller to adopt the compaction into session state.
+ */
+export interface ServerCompaction {
+	/** Provider compaction item id (e.g. cmpct_...). */
+	id: string;
+	/** The server-generated summary (pi convention: Goal/State/Files/Artifacts/Next). */
+	summary: string;
+	/** Server-rendered token count of the full input before compaction. */
+	inputTokens: number;
+	/** Number of input items the server summarized. */
+	itemsCompacted: number;
+	/** Number of input items the server retained verbatim (the tail). */
+	itemsRetained: number;
+	/**
+	 * For this request's input, the per-LLM-message count of Responses input
+	 * items (parallel to the transcript sent). Lets the caller map the
+	 * server's item-based cut point back to transcript message indexes.
+	 */
+	inputItemCounts?: number[];
+}
+
 export interface StreamOptions extends ProviderRequestOptions<Model<Api>> {
 	/**
 	 * Optional callback invoked after an HTTP response is received and before
@@ -220,7 +246,23 @@ export interface StreamOptions extends ProviderRequestOptions<Model<Api>> {
 	 * Event data is adapter-owned and must be treated as read-only.
 	 * Adapter support is explicit; unsupported adapters do not invoke it.
 	 */
+	/**
+	 * Optional callback invoked when the provider reports a server-side
+	 * compaction for this request (OpenAI Responses `context_management` /
+	 * local rukhm server compaction). Adapter support is explicit; only the
+	 * openai-responses adapter invokes it.
+	 */
+	onServerCompaction?: (compaction: ServerCompaction, model: Model<Api>) => void | Promise<void>;
+	/**
+	 * Request the provider to compact the input server-side when it crosses
+	 * the threshold (emitted as OpenAI Responses `context_management`). Only
+	 * supported by adapters that implement server-side compaction and by
+	 * providers that opt in via compat; otherwise ignored.
+	 */
+	contextManagement?: { compactThreshold: number };
 	onProviderStreamEvent?: (data: unknown, model: Model<Api>) => void | Promise<void>;
+	/** Custom token budgets for thinking levels (token-based providers only). */
+	thinkingBudgets?: ThinkingBudgets;
 	temperature?: number;
 	/**
 	 * Arbitrary sampling parameters merged into the request body as-is, after the named request
