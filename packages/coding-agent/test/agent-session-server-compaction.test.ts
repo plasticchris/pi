@@ -56,6 +56,42 @@ const assistant = (text: string): AssistantMessage => ({
 	timestamp: 0,
 });
 
+/**
+ * An assistant turn carrying a signed thinking block. The adapter emits this as
+ * TWO input items (a reasoning item + a message item) — the exact shape a
+ * reasoning-round-trip transcript has. The adoption walk must count it as 2 and
+ * keep the whole turn at a cut boundary.
+ */
+const assistantWithThinking = (text: string): AssistantMessage => ({
+	role: "assistant",
+	content: [
+		{
+			type: "thinking",
+			thinking: "scratchpad",
+			thinkingSignature: JSON.stringify({
+				type: "reasoning",
+				id: "rs_adopt_test",
+				status: "completed",
+				encrypted_content: "scratchpad",
+			}),
+		},
+		TEXT(text),
+	],
+	api: COMPATIBLE_MODEL.api,
+	provider: COMPATIBLE_MODEL.provider,
+	model: COMPATIBLE_MODEL.id,
+	usage: {
+		input: 100,
+		output: 10,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 110,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	},
+	stopReason: "stop",
+	timestamp: 0,
+});
+
 describe("AgentSession server-side compaction adoption", () => {
 	let tempDir: string;
 	let session: AgentSession;
@@ -218,5 +254,59 @@ describe("AgentSession server-side compaction adoption", () => {
 		(session.agent as { state: { model: Model<any> } }).state.model = { ...model, compat: undefined } as Model<any>;
 		await runPrepareRequest(session.agent.state.model);
 		expect(session.agent.contextManagement).toBeUndefined();
+	});
+
+	it("keeps a multi-item assistant turn (reasoning + message) whole at the cut", async () => {
+		const model = session.model!;
+		// Seed: system, user, assistant(signed thinking + text), user.
+		// The real adapter count for this session is [1, 1, 2, 1] — the thinking
+		// assistant emits a reasoning item AND a message item.
+		const ids: string[] = [];
+		ids.push(sessionManager.appendMessage(system("You are a test assistant.")));
+		ids.push(sessionManager.appendMessage(user("first question")));
+		ids.push(sessionManager.appendMessage(assistantWithThinking("first answer")));
+		ids.push(sessionManager.appendMessage(user("second question")));
+		const firstAnswerEntryId = ids[2];
+
+		await runPrepareRequest(model);
+
+		const callback = session.agent.onServerCompaction!;
+		// Deliberately NO inputItemCounts: the adoption walk must recompute the
+		// real per-group counts from the adapter (fallback path). The server
+		// compacted 3 items (system + "first question" + the reasoning item); the
+		// cut lands INSIDE the assistant group — the server kept only the message
+		// item of that turn. pi must keep the whole entry (reasoning + message)
+		// and never drop the reasoning item the server kept.
+		const compaction: ServerCompaction = {
+			id: "cmpct_reasoning",
+			summary: "## Goal\nAnswer follow-up questions.",
+			inputTokens: 1200,
+			itemsCompacted: 3,
+			itemsRetained: 2,
+		};
+		await callback(compaction, model as Model<any>);
+
+		const entry = getServerCompactionEntry();
+		expect(entry).toBeDefined();
+		if (!entry || entry.type !== "compaction") return;
+		// The first kept entry is the assistant turn, kept whole.
+		expect(entry.firstKeptEntryId).toBe(firstAnswerEntryId);
+
+		const projection = sessionManager.buildSessionProjection();
+		const projectionTexts = projection.messages.map((m) => {
+			if (m.role === "compactionSummary" || m.role === "branchSummary") return m.summary as string;
+			if (m.role === "user" || m.role === "assistant" || m.role === "system") {
+				if (typeof m.content === "string") return m.content;
+				if (Array.isArray(m.content)) {
+					return m.content.map((c) => ("text" in c && c.type === "text" ? c.text : "")).join("");
+				}
+				return "";
+			}
+			return "";
+		});
+		// The compacted prefix is gone; the kept assistant turn + tail survive.
+		expect(projectionTexts.filter((t) => t === "first question")).toHaveLength(0);
+		expect(projectionTexts.some((t) => t === "first answer")).toBe(true);
+		expect(projectionTexts.some((t) => t === "second question")).toBe(true);
 	});
 });

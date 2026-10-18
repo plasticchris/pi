@@ -304,3 +304,76 @@ describe("server-side compaction request emission (openai-responses)", () => {
 		expect(payload.context_management).toBeUndefined();
 	});
 });
+
+describe("reasoning items land in the emitted input array (adoption item counts)", () => {
+	const user = (text: string): Message => ({ role: "user", content: text, timestamp: 0 });
+
+	function modelWith(): Model<"openai-responses"> {
+		return {
+			id: "test-model",
+			name: "test-model",
+			api: "openai-responses",
+			provider: "test-provider",
+			baseUrl: "https://example.com/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 262144,
+			maxTokens: 8192,
+			compat: { serverSideCompaction: true },
+		};
+	}
+
+	function assistantWithThinking(model: Model<"openai-responses">, text: string): AssistantMessage {
+		return {
+			role: "assistant",
+			content: [
+				{
+					type: "thinking",
+					thinking: "scratchpad",
+					thinkingSignature: JSON.stringify({
+						type: "reasoning",
+						id: "rs_ai_test",
+						status: "completed",
+						encrypted_content: "scratchpad",
+					}),
+				},
+				{ type: "text", text },
+			],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 0,
+		};
+	}
+
+	it("emits a reasoning item (so the server's item count includes it) for a signed thinking block", async () => {
+		const model = modelWith();
+		const messages: Message[] = [
+			user("first question"),
+			assistantWithThinking(model, "first answer"),
+			user("second question"),
+		];
+		const payload = await capturePayload(model, messages);
+		const input = payload.input as Array<Record<string, unknown>>;
+		// user(1) + assistant(reasoning + message = 2) + user(1) = 4 items. If
+		// the reasoning item were dropped, this would be 3 and the server-side
+		// compaction item counts would desync from the client's adoption walk.
+		expect(input).toHaveLength(4);
+		const reasoningItems = input.filter((it) => it.type === "reasoning");
+		expect(reasoningItems).toHaveLength(1);
+		expect(reasoningItems[0]).toMatchObject({ id: "rs_ai_test", encrypted_content: "scratchpad" });
+		// The reasoning item is emitted immediately before its message item.
+		const reasoningIdx = input.findIndex((it) => it.type === "reasoning");
+		expect(input[reasoningIdx + 1]).toMatchObject({ type: "message", role: "assistant" });
+	});
+});
