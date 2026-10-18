@@ -1500,6 +1500,40 @@ describe("agentLoop with AgentMessage", () => {
 		expect(steeringPolls).toBe(3);
 	});
 
+	it("passes prepareRequest contextManagement to the stream options", async () => {
+		// The loop config is captured before the prepareRequest hook runs, so a
+		// per-request value returned by the hook (e.g. the server-compaction
+		// threshold) must be merged into the config the stream call sees.
+		const seen: Array<AgentLoopConfig["contextManagement"]> = [];
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			prepareRequest: () => ({ contextManagement: { compactThreshold: 12345 } }),
+		};
+
+		const stream = agentLoop(
+			[createUserMessage("run")],
+			{ messages: [], tools: [] },
+			config,
+			undefined,
+			(_model, _context, options) => {
+				seen.push(options?.contextManagement);
+				const response = createAssistantMessageEventStream();
+				queueMicrotask(() => {
+					response.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "done" }]),
+					});
+				});
+				return response;
+			},
+		);
+		await stream.result();
+
+		expect(seen).toEqual([{ compactThreshold: 12345 }]);
+	});
+
 	it("should use prepareNextTurn snapshot before continuing", async () => {
 		const toolSchema = Type.Object({ value: Type.String() });
 		const tool: AgentTool<typeof toolSchema, { value: string }> = {

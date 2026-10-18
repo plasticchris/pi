@@ -235,6 +235,10 @@ async function runLoop(
 							: requestUpdate.thinkingLevel === "off"
 								? undefined
 								: requestUpdate.thinkingLevel,
+					// Per-request options set by the prepareRequest hook (e.g. the
+					// server-compaction threshold) must reach the stream call; the
+					// loop config was captured before the hook ran.
+					contextManagement: requestUpdate.contextManagement ?? config.contextManagement,
 				};
 			}
 

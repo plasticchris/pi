@@ -1050,7 +1050,8 @@ export class AgentSession {
 			const model = previous?.model ?? this.agent.state.model;
 			const thinkingLevel = previous?.thinkingLevel ?? this.agent.state.thinkingLevel;
 			this._setServerCompactionRequestState(model);
-			if (!isVirtualModel(model)) return { ...previous, context, model, thinkingLevel };
+			if (!isVirtualModel(model))
+				return { ...previous, context, model, thinkingLevel, contextManagement: this.agent.contextManagement };
 
 			// The selection stays in agent state; only this request uses the routed model. A routing
 			// failure rejects, which ends the run with an error response. Only messages the user wrote
@@ -1082,7 +1083,13 @@ export class AgentSession {
 				({ previous, context } = await prepare());
 			}
 			this._setServerCompactionRequestState(route.model);
-			return { ...previous, context, model: route.model, thinkingLevel: route.thinkingLevel };
+			return {
+				...previous,
+				context,
+				model: route.model,
+				thinkingLevel: route.thinkingLevel,
+				contextManagement: this.agent.contextManagement,
+			};
 		};
 	}
 

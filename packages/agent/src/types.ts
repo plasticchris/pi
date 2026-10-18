@@ -167,6 +167,8 @@ export interface AgentLoopTurnUpdate {
 	model?: Model<any>;
 	/** Thinking level for the next provider request. */
 	thinkingLevel?: ThinkingLevel;
+	/** Per-request context management (e.g. the server-side compaction threshold). */
+	contextManagement?: SimpleStreamOptions["contextManagement"];
 }
 
 /** Runtime state available immediately before a conversational provider request. */
