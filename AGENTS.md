@@ -60,6 +60,7 @@ Committing:
 - Before committing, run `git status` and verify you are only staging your files.
 - `packages/ai/src/models.generated.ts` may always be included alongside your files.
 - Message format: `{feat,fix,docs}[(ai,tui,agent,coding-agent)]: <commit message> (optionally multiple lines)`. Message is informative and concise.
+- No AI co-author trailers: do not add a `Co-Authored-By:` line attributing the work to an AI (Claude, Copilot, etc.). A `.husky/prepare-commit-msg` hook strips any AI-attributed `Co-Authored-By:` footer before the commit is created (it runs even under `--no-verify`), but don't add one in the first place. Human co-authors are allowed and are preserved.
 
 Never run (destroys other agents' work or bypasses checks):
 

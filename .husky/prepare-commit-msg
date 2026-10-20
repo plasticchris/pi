@@ -1,0 +1,43 @@
+#!/bin/sh
+
+# Strip AI co-author trailers from the commit message before it is created.
+#
+# AI agents (Claude, Copilot, ...) habitually append a
+#   Co-Authored-By: <Agent> <...>
+# footer. We do not want those footers in this repo's history. This hook runs
+# in the `prepare-commit-msg` phase, which fires on the normal commit path and
+# even under `git commit --no-verify` (unlike `commit-msg`), and rewrites the
+# message file in place, so the trailer never reaches the object database.
+#
+# It removes only AI-attributed co-author lines. A human co-author
+# (Co-Authored-By: Name <addr>) is left untouched.
+#
+# This is deliberately a `prepare-commit-msg` hook and NOT a `commit-msg`
+# hook: `commit-msg` is skipped by --no-verify, `prepare-commit-msg` is not.
+
+# Only rewrite messages written for the commit itself. Leave the editor
+# template (source=template) alone; squash/merge are handled below.
+case "$2" in
+	message|merge) ;;
+	*) exit 0 ;;
+esac
+
+[ -f "$1" ] || exit 0
+
+# Identifiers that mark a co-author as an AI tool rather than a person.
+AI_RE='anthropic|claude|copilot|chatgpt|openai|codex|gemini|cursor|windsurf|codeium|cline|sourcegraph|tabnine|aider|roo|jules|assistant'
+
+tmp="$(mktemp)"
+# Drop co-authored-by lines (case-insensitive) whose name or email matches an
+# AI identifier.
+awk -v re="$AI_RE" '
+{
+	low = tolower($0)
+	if (low ~ /^[ \t]*co-authored-by:[ \t]*/ && low ~ re) next
+	print
+}
+' "$1" > "$tmp"
+# Trim any trailing blank lines the removals left behind.
+awk 'NF { p = NR } { line[NR] = $0 } END { if (p == 0) exit; for (i = 1; i <= p; i++) print line[i] }' "$tmp" > "$1"
+rm -f "$tmp"
+exit 0
