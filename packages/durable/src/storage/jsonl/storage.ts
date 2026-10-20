@@ -77,6 +77,16 @@ type EncodedCommit = {
 export type JsonlStorageOptions = {
 	/** Flush every affected sidecar before appending the main marker. Defaults to false. */
 	readonly fsync?: boolean;
+	/**
+	 * Open for observation only. A read-only storage replays the store into
+	 * memory and serves every read, but performs none of the open-time or
+	 * maintenance writes the normal path makes: it never creates the directory,
+	 * truncates torn tails, removes stray `.reclaim` files, or reclaims doc/
+	 * task sidecars. `commit()` throws. This makes it safe to open a store
+	 * that another live process owns as the sole writer — the reader shares the
+	 * disk but never touches it.
+	 */
+	readonly readOnly?: boolean;
 };
 
 export class JsonlCorruptionError extends Error {
@@ -247,6 +257,7 @@ export class JsonlStorage implements Storage {
 	private readonly memory = new MemoryStorage();
 	private readonly currentOnlyDocuments = new Set<DocumentId>();
 	private readonly liveTaskSidecars = new Set<TaskId>();
+	private readonly readOnly: boolean;
 	private closed = false;
 	private poisonError: JsonlStoragePoisonedError | undefined;
 
@@ -255,6 +266,12 @@ export class JsonlStorage implements Storage {
 		this.directory = directory;
 		this.mainPath = mainPath;
 		this.fsync = options.fsync ?? false;
+		this.readOnly = options.readOnly ?? false;
+	}
+
+	/** True when this storage was opened with `readOnly`. */
+	get isReadOnly(): boolean {
+		return this.readOnly;
 	}
 
 	/** Open or create a JSONL storage directory using the supplied filesystem. */
@@ -266,8 +283,20 @@ export class JsonlStorage implements Storage {
 	): Promise<JsonlStorage> {
 		const absolute = await fs.absolutePath(directory, context);
 		if (!absolute.ok) throw errorFromFile("path resolution", absolute.error);
-		const created = await fs.createDir(absolute.value, { recursive: true }, context);
-		if (!created.ok) throw errorFromFile("directory creation", created.error);
+		if (options.readOnly) {
+			// A reader must never create or write the store. A missing directory
+			// is an empty store, not an error; a present directory is replayed.
+			const present = await fs.exists(absolute.value, context);
+			if (!present.ok) throw errorFromFile("path existence", present.error);
+			if (!present.value) {
+				const mainPathResult = await fs.joinPath([absolute.value, MAIN_FILE], context);
+				if (!mainPathResult.ok) throw errorFromFile("path join", mainPathResult.error);
+				return new JsonlStorage(fs, absolute.value, mainPathResult.value, options);
+			}
+		} else {
+			const created = await fs.createDir(absolute.value, { recursive: true }, context);
+			if (!created.ok) throw errorFromFile("directory creation", created.error);
+		}
 		const mainPathResult = await fs.joinPath([absolute.value, MAIN_FILE], context);
 		if (!mainPathResult.ok) throw errorFromFile("path join", mainPathResult.error);
 		const storage = new JsonlStorage(fs, absolute.value, mainPathResult.value, options);
@@ -277,6 +306,7 @@ export class JsonlStorage implements Storage {
 
 	async commit(writes: readonly StorageWrite[], context: Context): Promise<Seq> {
 		this.assertUsable();
+		if (this.readOnly) throw new Error("JsonlStorage is read-only; commit is not allowed");
 		const prepared = this.memory.prepareCommit(writes);
 		const encoded = this.encodeCommit(prepared.seq, prepared.writes);
 		const reclamations = this.planReclamations(prepared.writes, encoded);
@@ -536,8 +566,13 @@ export class JsonlStorage implements Storage {
 		const fs = this.fs;
 		const directory = this.directory;
 		const memory = this.memory;
-		const main = await JsonlStorage.readLines(fs, this.mainPath, MAIN_FILE, context, (text, line) =>
-			parseMainMarker(text, line),
+		const main = await JsonlStorage.readLines(
+			fs,
+			this.mainPath,
+			MAIN_FILE,
+			context,
+			(text, line) => parseMainMarker(text, line),
+			!this.readOnly,
 		);
 		let previousSeq = 0;
 		for (const marker of main.lines) {
@@ -549,9 +584,11 @@ export class JsonlStorage implements Storage {
 
 		const listed = await fs.listDir(directory, context);
 		if (!listed.ok) throw errorFromFile("directory listing", listed.error);
-		for (const info of listed.value) {
-			if (info.kind === "file" && isReclaimFileName(info.name)) {
-				await fs.remove(info.path, { force: true }, context);
+		if (!this.readOnly) {
+			for (const info of listed.value) {
+				if (info.kind === "file" && isReclaimFileName(info.name)) {
+					await fs.remove(info.path, { force: true }, context);
+				}
 			}
 		}
 		const sidecarFiles = listed.value
@@ -563,8 +600,13 @@ export class JsonlStorage implements Storage {
 		for (const file of sidecarFiles) {
 			const pathResult = await fs.joinPath([directory, file], context);
 			if (!pathResult.ok) throw errorFromFile("path join", pathResult.error);
-			const parsed = await JsonlStorage.readLines(fs, pathResult.value, file, context, (text, line) =>
-				parseSidecarRecord(text, file, line),
+			const parsed = await JsonlStorage.readLines(
+				fs,
+				pathResult.value,
+				file,
+				context,
+				(text, line) => parseSidecarRecord(text, file, line),
+				!this.readOnly,
 			);
 			parsedFiles.set(file, parsed);
 			let previous: SidecarRecord | undefined;
@@ -727,7 +769,7 @@ export class JsonlStorage implements Storage {
 					unconfirmedAt = line.start;
 				}
 			}
-			if (unconfirmedAt !== undefined) {
+			if (unconfirmedAt !== undefined && !this.readOnly) {
 				const truncated = await fs.truncateFile(parsed.path, unconfirmedAt, context);
 				if (!truncated.ok) throw errorFromFile(`tail truncation of ${file}`, truncated.error);
 			}
@@ -756,7 +798,7 @@ export class JsonlStorage implements Storage {
 				reclamations.set(file, retainedLines.map((line) => jsonLine(line.value)).join(""));
 			}
 		}
-		await this.reclaimSidecars(reclamations, context);
+		if (!this.readOnly) await this.reclaimSidecars(reclamations, context);
 
 		for (const id of currentOnlyDocuments) this.currentOnlyDocuments.add(id);
 		for (const [id, live] of finalTaskIsLive) {
@@ -789,6 +831,7 @@ export class JsonlStorage implements Storage {
 		name: string,
 		context: Context,
 		parse: (text: string, line: number) => T,
+		allowWrites = true,
 	): Promise<ParsedFile<T>> {
 		const read = await fs.readBinaryFile(path, context);
 		if (!read.ok) {
@@ -799,8 +842,10 @@ export class JsonlStorage implements Storage {
 		let completeSize = bytes.length;
 		if (completeSize > 0 && bytes[completeSize - 1] !== 0x0a) {
 			completeSize = bytes.lastIndexOf(0x0a) + 1;
-			const truncated = await fs.truncateFile(path, completeSize, context);
-			if (!truncated.ok) throw errorFromFile(`torn-line truncation of ${name}`, truncated.error);
+			if (allowWrites) {
+				const truncated = await fs.truncateFile(path, completeSize, context);
+				if (!truncated.ok) throw errorFromFile(`torn-line truncation of ${name}`, truncated.error);
+			}
 		}
 		const lines: ParsedLine<T>[] = [];
 		let start = 0;

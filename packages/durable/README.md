@@ -760,7 +760,7 @@ const usage = await harness.usage(context); // { models: { "openai/gpt-6-sol": U
 |---|---|---|
 | Memory | `MemoryStorage` from the package root | Nothing is persisted. |
 | SQLite | `openNodeSqliteStorage(file)` from `@earendil-works/pi-durable/storage/sqlite/node` | One database file. WAL mode with `synchronous = NORMAL`: commits survive process crashes; the newest may be lost on power or host failure. |
-| JSONL | `openNodeJsonlStorage(directory, context)` from `@earendil-works/pi-durable/storage/jsonl/node` | Append-only files in one directory. Pass `{ fsync: true }` to flush before each commit marker. Keeps the whole history in memory too, so memory grows with it; use SQLite for long-running agents. |
+| JSONL | `openNodeJsonlStorage(directory, context)` from `@earendil-works/pi-durable/storage/jsonl/node` | Append-only files in one directory. Pass `{ fsync: true }` to flush before each commit marker; pass `{ readOnly: true }` to open for observation only (see below). Keeps the whole history in memory too, so memory grows with it; use SQLite for long-running agents. |
 | Cloudflare Durable Object | `openDurableObjectSqliteStorage(ctx.storage)` from `@earendil-works/pi-durable/storage/sqlite/cloudflare` | The SQLite storage of one SQLite-backed Durable Object; commits are its storage transactions. |
 
 SQLite storage can namespace its tables and indexes when sharing a database: pass `{ prefix: "pi_" }` to
@@ -780,7 +780,7 @@ await database.exec("CREATE TABLE IF NOT EXISTS host_notes (text TEXT)");
 await database.run("INSERT INTO host_notes (text) VALUES (?)", text);
 ```
 
-One process owns a storage at a time; there is no cross-process locking. The portable SQLite and JSONL cores (`/storage/sqlite`, `/storage/jsonl`) run without Node APIs, for example on Bun or in Cloudflare Durable Objects, given an asynchronous `SqliteDatabase` facade or a `FileSystem` from `@earendil-works/pi-durable/env`.
+One process owns a storage at a time; there is no cross-process locking. A second live process may **read** a JSONL store the first owns, but not as an ordinary open: a normal `open()` replays the store and also performs maintenance writes (it truncates torn tails, removes stray `.reclaim` files, and reclaims document/task sidecars), which would race the writer. To observe a store another live process is writing, open it read-only with `openNodeJsonlStorage(directory, context, { readOnly: true })` (or `JsonlStorage.open(..., { readOnly: true })`). A read-only storage replays the store into memory and serves every read, but makes no filesystem writes — not on open, on `close()`, and ever (its `commit()` throws). It sees a consistent snapshot of what was committed at the moment it opened; it does not see commits the writer makes afterward. The portable SQLite and JSONL cores (`/storage/sqlite`, `/storage/jsonl`) run without Node APIs, for example on Bun or in Cloudflare Durable Objects, given an asynchronous `SqliteDatabase` facade or a `FileSystem` from `@earendil-works/pi-durable/env`.
 
 SQLite adapters implement promise-based `exec`, `run`, `get`, `all`, `transaction`, and `close`. `run`, `get`, and `all` take SQL text plus positional bindings; adapters may cache prepared statements by SQL text. A transaction callback receives a transaction handle; all work in the transaction must use it, and the handle expires when the callback settles. Adapters must queue unrelated operations and other transactions until the transaction finishes, so calling `database` itself inside the callback never settles:
 
