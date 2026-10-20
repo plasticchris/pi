@@ -28,6 +28,7 @@ import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
 import {
 	convertResponsesMessages,
 	convertResponsesTools,
+	getResponsesToolSupport,
 	processResponsesStream,
 	type ResponsesItemCounts,
 } from "./openai-responses-shared.ts";
@@ -345,10 +346,7 @@ function buildParams(
 	grammarToolInputProperties: ReadonlyMap<string, string>,
 	configurationUpdateEffort: string | undefined,
 ): { params: ResponseCreateParamsStreaming; itemCounts: number[] } {
-	const transcriptTools = resolveTranscriptTools(
-		context.messages,
-		compat.supportsAdditionalTools || compat.supportsToolSearch,
-	);
+	const transcriptTools = resolveTranscriptTools(context.messages, getResponsesToolSupport(compat));
 	const itemCounter: ResponsesItemCounts = { counts: [] };
 	const messages = convertResponsesMessages(
 		model,
