@@ -13,6 +13,44 @@ import {
 } from "@earendil-works/pi-ai";
 import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
+
+// TEMP DEBUG (2026-10-18, premature-stop investigation): every abort() of a
+// run's AbortController appends a stack trace to /tmp/pi-abort-trace.log (or
+// $PI_ABORT_TRACE if set; PI_ABORT_TRACE=0 disables) so we can see WHO aborts
+// in-flight model requests. The bug: pi sessions on rukhm :8045 (both
+// /v1/responses and /v1/chat/completions) die with 'Operation aborted', 0
+// tokens, ~7-17s into the request, since 2026-10-18 ~15:06 UTC; the server
+// logs the matching ClientGone and was generating fine. Remove once root-caused.
+// NOTE: node:fs is acquired via process.getBuiltinModule (no import, no
+// require) so NEITHER the browser bundle (platform:"browser" — a static
+// node:fs import breaks it) nor the node bundle validator (a typeof require()
+// dynamic require becomes an unexpected "<runtime>" external) sees it. Only
+// ever reached in Node; absent there (browser) -> no-op. Verified via
+// scripts probe of both build configs.
+const ABORT_TRACE_DEFAULT = "/tmp/pi-abort-trace.log";
+let _appendFileSync: ((path: string, data: string) => void) | undefined;
+function traceRunAbort(label: string, sessionId?: string): void {
+	try {
+		const env = process.env.PI_ABORT_TRACE;
+		if (env === "0") return;
+		if (_appendFileSync === undefined) {
+			// Node >= 20.6 exposes getBuiltinModule; on the browser it is absent
+			// (process itself may be too) and the whole call is a no-op.
+			const fs = (process as { getBuiltinModule?: (id: string) => unknown }).getBuiltinModule?.("node:fs") as
+				| { appendFileSync?: (path: string, data: string) => void }
+				| undefined;
+			_appendFileSync = fs?.appendFileSync;
+		}
+		const path = env || ABORT_TRACE_DEFAULT;
+		_appendFileSync?.(
+			path,
+			`${label} ${new Date().toISOString()} pid=${process.pid} session=${sessionId ?? "?"}\n${new Error("abort-trace").stack}\n---\n`,
+		);
+	} catch {
+		// tracing must never break the run
+	}
+}
+
 import type {
 	AfterToolCallContext,
 	AfterToolCallResult,
@@ -343,6 +381,7 @@ export class Agent {
 
 	/** Abort the current run, if one is active. */
 	abort(): void {
+		traceRunAbort("Agent.abort", this.sessionId);
 		this.activeRun?.abortController.abort();
 	}
 
@@ -516,6 +555,11 @@ export class Agent {
 		}
 
 		const abortController = new AbortController();
+		const rawAbort = abortController.abort.bind(abortController);
+		abortController.abort = (reason?: unknown): void => {
+			traceRunAbort("AbortController.abort", this.sessionId);
+			rawAbort(reason);
+		};
 		let resolvePromise = () => {};
 		const promise = new Promise<void>((resolve) => {
 			resolvePromise = resolve;
