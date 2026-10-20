@@ -292,9 +292,12 @@ export class FooterComponent implements Component {
 			const sortedStatuses = Array.from(extensionStatuses.entries())
 				.sort(([a], [b]) => a.localeCompare(b))
 				.map(([, text]) => sanitizeStatusText(text));
-			const statusLine = sortedStatuses.join(" ");
+			// Extensions may embed their own color codes; strip them so the line renders
+			// uniformly dim like the rest of the footer (an embedded reset also re-brightens
+			// every status after it).
+			const statusLine = sortedStatuses.join(" ").replace(/\x1b\[[0-9;:]*m/g, "");
 			// Truncate to terminal width with dim ellipsis for consistency with footer style
-			lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));
+			lines.push(truncateToWidth(theme.fg("dim", statusLine), width, theme.fg("dim", "...")));
 		}
 
 		return lines;
