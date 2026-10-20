@@ -500,7 +500,7 @@ describe("AgentSession prompt characterization", () => {
 		await promptPromise;
 	});
 
-	it("throws when prompted during manual compaction", async () => {
+	it("defers a prompt during manual compaction and delivers it after", async () => {
 		let markCompactionStarted = () => {};
 		const compactionStarted = new Promise<void>((resolve) => {
 			markCompactionStarted = resolve;
@@ -529,7 +529,7 @@ describe("AgentSession prompt characterization", () => {
 			],
 		});
 		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two"), fauxAssistantMessage("three")]);
 		await harness.session.prompt("first");
 		await harness.session.prompt("second");
 
@@ -537,9 +537,17 @@ describe("AgentSession prompt characterization", () => {
 		await compactionStarted;
 
 		try {
-			await expect(harness.session.prompt("third")).rejects.toThrow(
-				"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
-			);
+			// No throw: the prompt is deferred while compaction is in progress.
+			const deferredPrompt = harness.session.prompt("third");
+			await deferredPrompt;
+
+			// Not executed yet: the third response is still unconsumed.
+			expect(getMessageText(harness.session.messages.at(-1))).toBe("two");
+
+			releaseCompaction();
+			// The deferred prompt is re-submitted inside compact(), before it resolves.
+			await compactPromise;
+			expect(getMessageText(harness.session.messages.at(-1))).toBe("three");
 		} finally {
 			releaseCompaction();
 			await compactPromise;

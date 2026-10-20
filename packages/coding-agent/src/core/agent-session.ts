@@ -1337,16 +1337,24 @@ export class AgentSession {
 			this._isEmittingAgentSettled = false;
 		}
 
-		const deferred = this._deferredSettledActions.splice(0);
-		if (deferred.length > 0) {
-			try {
-				for (const action of deferred) await action();
-			} finally {
-				this._resolveIdleWaitIfIdle();
-			}
-			return;
-		}
+		if (await this._flushDeferredSettledActions()) return;
 		this._resolveIdleWaitIfIdle();
+	}
+
+	/**
+	 * Re-submit the prompts and custom messages that were deferred while the session was
+	 * busy (agent-settled flush or compaction in progress). Returns true if anything was
+	 * flushed, so callers can skip their trailing idle-wait resolution.
+	 */
+	private async _flushDeferredSettledActions(): Promise<boolean> {
+		const deferred = this._deferredSettledActions.splice(0);
+		if (deferred.length === 0) return false;
+		try {
+			for (const action of deferred) await action();
+		} finally {
+			this._resolveIdleWaitIfIdle();
+		}
+		return true;
 	}
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
@@ -2300,6 +2308,7 @@ export class AgentSession {
 	 * - Handles extension commands (registered via pi.registerCommand) immediately, even during streaming
 	 * - Expands file-based prompt templates by default
 	 * - During streaming, queues via steer() or followUp() based on streamingBehavior option
+	 * - While compaction is in progress, defers and re-submits the prompt when compaction ends
 	 * - Validates model and API key before sending (when not streaming)
 	 * @throws Error if streaming and no streamingBehavior specified
 	 * @throws Error if no model selected or no API key available (when not streaming)
@@ -2323,9 +2332,11 @@ export class AgentSession {
 		}
 
 		if (this._compactionAbortController !== undefined) {
-			throw new Error(
-				"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
-			);
+			// Defer and re-submit once compaction finishes instead of throwing, so prompts
+			// that arrive mid-compaction (user input, extension notifications, forge wakes)
+			// are retried rather than lost behind a surfaced error.
+			this._deferredSettledActions.push(async () => await this.prompt(text, options));
+			return;
 		}
 
 		// Emit input event for extension interception (before skill/template expansion)
@@ -3153,6 +3164,10 @@ export class AgentSession {
 			};
 			// compaction_end listeners may submit queued prompts, so expose idle state before notifying them.
 			this._clearManualCompactionState();
+			// Deliver prompts that arrived during compaction before listeners run: they are
+			// re-submitted here (not lost, not surfaced as errors) and complete before
+			// compact() resolves.
+			await this._flushDeferredSettledActions();
 			this._emit({
 				type: "compaction_end",
 				reason: "manual",
@@ -3166,6 +3181,9 @@ export class AgentSession {
 			const aborted = this._compactionAbortController.signal.aborted || cancelledByExtension;
 			const errorMessage = aborted ? undefined : `Compaction failed: ${message}`;
 			this._clearManualCompactionState();
+			// The session is usable again after a failed/aborted compaction, so prompts
+			// deferred during it are still delivered (and not lost).
+			await this._flushDeferredSettledActions();
 			this._emit({
 				type: "compaction_end",
 				reason: "manual",
