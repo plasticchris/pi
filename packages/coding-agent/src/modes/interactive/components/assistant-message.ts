@@ -8,6 +8,12 @@ const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
 
+class ThinkingMarkdown extends Markdown {
+	override render(width: number): string[] {
+		return super.render(width).map((line) => theme.fg("thinkingText", line.replace(/\x1b\[[0-9;:]*m/g, "")));
+	}
+}
+
 /**
  * Component that renders a complete assistant message
  */
@@ -142,24 +148,14 @@ export class AssistantMessageComponent extends Container {
 				const runIndex = thinkingRunIndex++;
 				const hidden = this.thinkingVisibilityOverrides.get(runIndex) ?? this.hideThinkingBlock;
 				const thinkingComponent = hidden
-					? new Text(theme.italic(theme.fg("thinkingText", this.hiddenThinkingLabel)), this.outputPad, 0)
-					: new Markdown(
-							thinkingBlocks.join("\n\n"),
-							this.outputPad,
-							0,
-							this.markdownTheme,
-							{
-								color: (text: string) => theme.fg("thinkingText", text),
-								italic: true,
-							},
-							{
-								transform: createMarkdownTransform(
-									"assistant-thinking",
-									this.isStreaming,
-									this.markdownTransformers,
-								),
-							},
-						);
+					? new Text(theme.fg("thinkingText", this.hiddenThinkingLabel), this.outputPad, 0)
+					: new ThinkingMarkdown(thinkingBlocks.join("\n\n"), this.outputPad, 0, this.markdownTheme, undefined, {
+							transform: createMarkdownTransform(
+								"assistant-thinking",
+								this.isStreaming,
+								this.markdownTransformers,
+							),
+						});
 				this.contentContainer.addChild(
 					new MouseRegion(thinkingComponent, (event) => {
 						if (event.type !== "click" || event.button !== "left") return undefined;
