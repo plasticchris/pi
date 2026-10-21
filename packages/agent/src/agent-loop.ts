@@ -701,6 +701,12 @@ type ToolUpdateSink = (partialResult: AgentToolResult<any>) => Promise<void> | v
 
 type FinalizedToolCallEntry = FinalizedToolCallOutcome | (() => Promise<FinalizedToolCallOutcome>);
 
+/**
+ * Sentinel for "the run was aborted while the tool was executing", used to distinguish an abort
+ * from a genuine tool result in {@link executePreparedToolCall}.
+ */
+const ABORTED_TOOL_RESULT: unique symbol = Symbol("aborted-tool-result");
+
 function shouldTerminateToolBatch(finalizedCalls: FinalizedToolCallOutcome[]): boolean {
 	return finalizedCalls.length > 0 && finalizedCalls.every((finalized) => finalized.result.terminate === true);
 }
@@ -842,20 +848,40 @@ async function executePreparedToolCall(
 	const startedAt = performance.now();
 	const elapsed = () => Math.round(performance.now() - startedAt);
 
+	const execution = prepared.tool.execute(prepared.toolCall.id, prepared.args as never, signal, (partialResult) => {
+		if (!acceptingUpdates) return;
+		updateEvents.push(Promise.resolve(onUpdate(partialResult)));
+	});
+	// If the run is aborted while the tool is executing, release the loop immediately instead of
+	// waiting for a tool that may ignore the signal. The in-flight call keeps running in the
+	// background (a durable work is not affected); only this loop's wait ends.
+	const abortPromise = new Promise<unknown>((resolve) => {
+		if (!signal) return; // never settles without a signal
+		if (signal.aborted) return resolve(ABORTED_TOOL_RESULT);
+		signal.addEventListener("abort", () => resolve(ABORTED_TOOL_RESULT), { once: true });
+	});
+	// The outcome we act on always comes through the race below, which observes rejections of the
+	// execution promise; this keeps a rejection of the (now possibly ignored) promise from being
+	// unhandled after the race settles via the abort.
+	execution.catch(() => {});
+
 	try {
-		const result = await prepared.tool.execute(
-			prepared.toolCall.id,
-			prepared.args as never,
-			signal,
-			(partialResult) => {
-				if (!acceptingUpdates) return;
-				updateEvents.push(Promise.resolve(onUpdate(partialResult)));
-			},
-		);
+		const result = await Promise.race([execution, abortPromise]);
 		const durationMs = elapsed();
 		acceptingUpdates = false;
 		await Promise.all(updateEvents);
-		return { result, isError: result.isError === true, durationMs };
+		if (result === ABORTED_TOOL_RESULT) {
+			return {
+				result: createErrorToolResult("Operation aborted (interrupted tool call)"),
+				isError: true,
+				durationMs,
+			};
+		}
+		return {
+			result: result as AgentToolResult<any>,
+			isError: (result as AgentToolResult<any>).isError === true,
+			durationMs,
+		};
 	} catch (error) {
 		const durationMs = elapsed();
 		acceptingUpdates = false;
