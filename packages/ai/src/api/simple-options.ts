@@ -52,6 +52,7 @@ export function buildBaseOptions(
 		cacheRetention: options?.cacheRetention,
 		sessionId: options?.sessionId,
 		headers: options?.headers,
+		identity: options?.identity,
 		onPayload: options?.onPayload,
 		onServerCompaction: options?.onServerCompaction,
 		onResponse: options?.onResponse,
