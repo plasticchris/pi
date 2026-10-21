@@ -3,6 +3,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { PromptDisposition } from "../../../src/core/agent-session.ts";
 import { createHarness, getMessageText, getUserTexts, type Harness } from "../harness.ts";
 
+// issue #7150: an RPC prompt arriving while manual compaction is in progress must not
+// surface as a raw runtime error and must not be lost. Upstream fixed this by rejecting
+// the prompt ("Cannot submit a prompt while compaction is in progress"); this fork
+// supersedes that with deferral (18af7d95d): the prompt resolves, waits out the
+// compaction, and is re-submitted before compact() resolves — so the RPC response
+// reports "started" and the message is delivered exactly once.
 describe("issue #7150: RPC prompt during manual compaction", () => {
 	const harnesses: Harness[] = [];
 
@@ -12,7 +18,7 @@ describe("issue #7150: RPC prompt during manual compaction", () => {
 		}
 	});
 
-	it("rejects an RPC prompt while manual compaction is in progress", async () => {
+	it("defers an RPC prompt while manual compaction is in progress and delivers it after", async () => {
 		let markCompactionStarted = () => {};
 		const compactionStarted = new Promise<void>((resolve) => {
 			markCompactionStarted = resolve;
@@ -61,6 +67,7 @@ describe("issue #7150: RPC prompt during manual compaction", () => {
 		let preflightResult: PromptDisposition | undefined;
 		let promptError: unknown;
 		try {
+			// No throw: the prompt is deferred while compaction is in progress.
 			await harness.session.prompt("PROBE-7150", {
 				source: "rpc",
 				preflightResult: (result) => {
@@ -74,19 +81,20 @@ describe("issue #7150: RPC prompt during manual compaction", () => {
 			await compactPromise;
 		}
 
+		expect(promptError).toBeUndefined();
+		// Delivered after compaction: the deferred re-submission ran inside compact().
+		expect(preflightResult).toBe("started");
+
 		const persistedUserTexts = harness.sessionManager
 			.getEntries()
 			.flatMap((entry) =>
 				entry.type === "message" && entry.message.role === "user" ? [getMessageText(entry.message)] : [],
 			);
 
-		expect(preflightResult).toBeUndefined();
-		expect(promptError).toEqual(
-			expect.objectContaining({ message: expect.stringContaining("compaction is in progress") }),
-		);
-		expect(getUserTexts(harness)).not.toContain("PROBE-7150");
-		expect(persistedUserTexts).not.toContain("PROBE-7150");
-		expect(harness.eventsOfType("agent_start")).toHaveLength(0);
-		expect(harness.eventsOfType("agent_settled")).toHaveLength(0);
+		// The message was not lost, and it did not run concurrently with the compaction.
+		expect(getUserTexts(harness)).toContain("PROBE-7150");
+		expect(persistedUserTexts).toContain("PROBE-7150");
+		expect(harness.eventsOfType("agent_start")).toHaveLength(1);
+		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
 	});
 });
