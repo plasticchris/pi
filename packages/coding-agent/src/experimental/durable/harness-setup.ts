@@ -13,6 +13,7 @@ import { applyHttpProxySettings, configureHttpDispatcher } from "../../core/http
 import { findInitialModel, resolveCliModel } from "../../core/model-resolver.ts";
 import type { ModelRuntime } from "../../core/model-runtime.ts";
 import type { SettingsManager } from "../../core/settings-manager.ts";
+import type { ExtensionHost } from "./extension-host.ts";
 import { createPiPrompt } from "./prompt.ts";
 
 /** pi's HTTP setup: proxy, idle timeouts, and one undici for fetch. Without it, some provider streams break off. */
@@ -48,11 +49,12 @@ export function createHarnessSettings(settingsManager: SettingsManager): Harness
 	};
 }
 
-/** A registry with pi's coding tools and system prompt. */
-export function createCodingRegistry(settingsManager: SettingsManager, cwd: string): Registry {
+/** A registry with pi's coding tools and system prompt; the host's bridge tools join it via `host.bindRegistry`. */
+export function createCodingRegistry(settingsManager: SettingsManager, cwd: string, host: ExtensionHost): Registry {
 	const registry = createRegistry();
+	host.bindRegistry(registry);
 	registry.install(CodingTools);
-	registry.install(createPiPrompt(settingsManager, cwd));
+	registry.install(createPiPrompt(settingsManager, cwd, host));
 	return registry;
 }
 

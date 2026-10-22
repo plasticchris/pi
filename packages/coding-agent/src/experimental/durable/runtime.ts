@@ -15,8 +15,10 @@ import {
 	type TaskGraph,
 } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
+import { getAgentDir } from "../../config.ts";
 import { ModelRuntime } from "../../core/model-runtime.ts";
 import { SettingsManager } from "../../core/settings-manager.ts";
+import { createExtensionHost, type ExtensionHost } from "./extension-host.ts";
 import {
 	configureHarnessHttp,
 	createCodingRegistry,
@@ -81,6 +83,8 @@ export interface DurableController {
 export interface OpenDurableOptions {
 	readonly cwd?: string;
 	readonly continueSession?: boolean;
+	/** Extra extension paths (PI_DURABLE_EXTENSION_PATHS), loaded like pi's `-e`. */
+	readonly additionalExtensionPaths?: string[];
 }
 
 export interface OpenDurableResult {
@@ -88,6 +92,10 @@ export interface OpenDurableResult {
 	readonly controller: DurableController;
 	/** pi's settings, for the TUI's theme and terminal capabilities. */
 	readonly settings: SettingsManager;
+	/** The pi extension host, for the TUI's dispatch seam and shutdown hook. */
+	readonly host: ExtensionHost;
+	/** Add a TUI notice. */
+	notice(level: "info" | "warning" | "error", message: string): void;
 	close(): Promise<void>;
 }
 
@@ -129,9 +137,25 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 		const modelRuntime = await ModelRuntime.create();
 		const settingsManager = SettingsManager.create(location.cwd);
 		configureHarnessHttp(settingsManager);
+		// Load-time diagnostics arrive before the view exists; buffer them until the notice
+		// closure is live, then replay.
+		const earlyNotices: Array<{ level: Notice["level"]; message: string }> = [];
+		let routeNotice: (level: Notice["level"], message: string) => void = (level, message) =>
+			earlyNotices.push({ level, message });
+		// The host keeps this stable forwarder; routeNotice switches to the live notice once the view exists.
+		const hostNotice = (level: Notice["level"], message: string): void => routeNotice(level, message);
+		const host = await createExtensionHost({
+			cwd: location.cwd,
+			agentDir: getAgentDir(),
+			settings: settingsManager,
+			modelRuntime,
+			additionalExtensionPaths: options.additionalExtensionPaths ?? [],
+			notice: hostNotice,
+		});
 		const settings = createHarnessSettings(settingsManager);
-		const registry = createCodingRegistry(settingsManager, location.cwd);
+		const registry = createCodingRegistry(settingsManager, location.cwd, host);
 		registry.install(Subagent);
+		registry.install(host.bridge());
 
 		const pendingReports: unknown[] = [];
 		let report: (error: unknown) => void = (error) => pendingReports.push(error);
@@ -196,6 +220,8 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 		const notice = (level: Notice["level"], message: string): void => {
 			update({ notices: [...state.notices, { id: nextNotice++, level, message }].slice(-20) });
 		};
+		routeNotice = notice;
+		for (const item of earlyNotices) notice(item.level, item.message);
 		const fail = (error: unknown): void => notice("error", error instanceof Error ? error.message : String(error));
 		report = (error) => notice("warning", error instanceof Error ? error.message : String(error));
 		for (const error of pendingReports) report(error);
@@ -247,7 +273,7 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 				throw new Error(ref === undefined ? "No model selected" : "Current model is unavailable");
 			return model;
 		};
-		const controller: DurableController = {
+		const rawController: DurableController = {
 			submit: (text, whenBusy) =>
 				command(async () => watchAnswer(await current.submit({ type: "input", content: text, whenBusy }, context))),
 			compact: (instructions) =>
@@ -320,6 +346,23 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 				}),
 		};
 
+		const viewSource: DurableViewSource = {
+			current: () => state,
+			subscribe: (listener) => {
+				listeners.add(listener);
+				return () => listeners.delete(listener);
+			},
+		};
+		const controller = host.wrapController(rawController);
+		host.attach({
+			view: viewSource,
+			conversation: root,
+			context,
+			controller,
+			getConversation: (id) => opened.conversation(id, context),
+		});
+
+		await host.fireSessionStart(location.created ? "startup" : "resume");
 		const saved = agentOf(state.conversation).model;
 		if (saved === undefined) notice("warning", "No model configured; select one with /model.");
 		else if (modelRuntime.getModel(saved.provider, saved.modelId) === undefined) {
@@ -333,21 +376,19 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 
 		let closing: Promise<void> | undefined;
 		return {
-			view: {
-				current: () => state,
-				subscribe: (listener) => {
-					listeners.add(listener);
-					return () => listeners.delete(listener);
-				},
-			},
+			view: viewSource,
 			controller,
 			settings: settingsManager,
+			host,
+			notice,
 			close() {
 				closing ??= (async () => {
 					unsubscribe();
 					unsubscribeCommits();
 					conversation.dispose();
 					closeTasks();
+					// Fires session_shutdown before the harness closes.
+					await host.close();
 					try {
 						// Close writes no outcome: a running turn resumes with --continue.
 						await opened.close(context);

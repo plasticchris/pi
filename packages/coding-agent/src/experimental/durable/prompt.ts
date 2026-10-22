@@ -8,6 +8,7 @@ import { bashToolSystemPromptContribution } from "../../core/tools/bash.ts";
 import { editToolSystemPromptContribution } from "../../core/tools/edit.ts";
 import { readToolSystemPromptContribution } from "../../core/tools/read.ts";
 import { writeToolSystemPromptContribution } from "../../core/tools/write.ts";
+import type { ExtensionHost } from "./extension-host.ts";
 
 const CONTRIBUTIONS = {
 	read: readToolSystemPromptContribution,
@@ -16,16 +17,24 @@ const CONTRIBUTIONS = {
 	write: writeToolSystemPromptContribution,
 };
 
-/** pi's section order; `buildSystemPromptSections()` omits the ones without content. */
-const KEYS = ["preamble", "tools", "rules", "docs", "project_context", "skills", "cwd"] as const;
+/**
+ * pi's section order, with `addendum` where pi places the append system prompt;
+ * `buildSystemPromptSections()` omits the ones without content.
+ */
+const KEYS = ["preamble", "tools", "rules", "docs", "addendum", "project_context", "skills", "cwd"] as const;
 
 /**
  * pi's system prompt as one extension: the sections of `buildSystemPromptSections()` for the request's tools and the
- * conversation's directory. Context files and skills load once per directory, like pi at startup.
+ * conversation's directory. For the session directory the resources come from the extension host's ResourceLoader
+ * (skills, context files, discovered system-prompt overrides); other directories keep the direct per-cwd load.
  */
-export function createPiPrompt(settings: SettingsManager, fallbackCwd: string) {
+export function createPiPrompt(settings: SettingsManager, fallbackCwd: string, host: ExtensionHost) {
 	const resources = new Map<string, { contextFiles: { path: string; content: string }[]; skills: Skill[] }>();
 	const load = (cwd: string) => {
+		if (cwd === fallbackCwd) {
+			const loaderResources = host.resources();
+			return { contextFiles: [...loaderResources.agentsFiles], skills: [...loaderResources.skills] };
+		}
 		let found = resources.get(cwd);
 		if (found === undefined) {
 			const agentDir = getAgentDir();
@@ -54,15 +63,26 @@ export function createPiPrompt(settings: SettingsManager, fallbackCwd: string) {
 		const guidelines: Record<string, string[]> = {};
 		for (const name of selectedTools) {
 			const contribution = CONTRIBUTIONS[name as keyof typeof CONTRIBUTIONS];
-			if (contribution === undefined) continue;
-			snippets[name] = contribution.snippet;
-			guidelines[name] = [...contribution.guidelines];
+			if (contribution !== undefined) {
+				snippets[name] = contribution.snippet;
+				guidelines[name] = [...contribution.guidelines];
+			}
+			// Bridged extension tools contribute their prompt fields, like pi's custom tools.
+			const bridged = host.toolPrompts().get(name);
+			if (bridged?.snippet !== undefined) snippets[name] = bridged.snippet;
+			if (bridged?.guidelines !== undefined) guidelines[name] = [...(guidelines[name] ?? []), ...bridged.guidelines];
 		}
+		const hostResources = host.resources();
+		const appendSystemPrompt = hostResources.appendSystemPrompt.join("\n\n");
 		return buildSystemPromptSections({
 			cwd,
 			selectedTools,
 			toolSnippets: snippets,
 			toolGuidelines: guidelines,
+			// pi semantics: a discovered SYSTEM.md replaces the preamble and tools/rules/docs sections;
+			// project context, skills, and cwd still render (DESIGN §4, decision D13).
+			...(hostResources.systemPrompt === undefined ? {} : { customPrompt: hostResources.systemPrompt }),
+			...(appendSystemPrompt === "" ? {} : { appendSystemPrompt }),
 			...load(cwd),
 		});
 	};

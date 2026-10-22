@@ -44,7 +44,9 @@ import { ToolExecutionComponent, type ToolRenderers } from "../../modes/interact
 import { UserMessageComponent } from "../../modes/interactive/components/user-message.ts";
 import { getEditorTheme, getMarkdownTheme, initTheme, theme } from "../../modes/interactive/theme/theme.ts";
 import { InteractiveThemeController } from "../../modes/interactive/theme/theme-controller.ts";
-import { agentOf, type DurableController, type DurableView, type DurableViewSource } from "./runtime.ts";
+import { commands, type DurableCommandContext, expandInput, panels } from "./command-registry.ts";
+import type { ExtensionHost } from "./extension-host.ts";
+import { agentOf, type DurableController, type DurableView, type DurableViewSource, type Notice } from "./runtime.ts";
 
 const SELECT_THEME: SelectListTheme = {
 	selectedPrefix: (text) => theme.fg("accent", text),
@@ -547,7 +549,7 @@ function totalUsage(state: UsageState): Usage {
 }
 
 /** Context size from the newest successful answer after the newest compaction; unknown before one. */
-function contextTokens(entries: readonly EntryRecord[]): number | undefined {
+export function contextTokens(entries: readonly EntryRecord[]): number | undefined {
 	// Kept entries follow the summary in the view but are older than it; only later answers measure the new context.
 	const compacted = Math.max(0, ...entries.filter((entry) => entry.kind === "pi.compaction").map((entry) => entry.id));
 	for (const entry of [...entries].reverse()) {
@@ -564,6 +566,8 @@ export async function runDurableTui(
 	source: DurableViewSource,
 	controller: DurableController,
 	settings: SettingsManager,
+	notice: (level: Notice["level"], message: string) => void,
+	host: ExtensionHost,
 ): Promise<void> {
 	setCapabilityOverrides(settings.getTerminalCapabilityOverrides());
 	// The system theme until the controller resolves the user's theme against the terminal's colors.
@@ -618,10 +622,30 @@ export async function runDurableTui(
 		view.mount(selector);
 	};
 
+	// DESIGN.md §6.2: the context registered commands, panels, and expanders receive.
+	const commandContextFor = (text: string): DurableCommandContext => {
+		const snapshot = source.current();
+		const space = text.indexOf(" ");
+		const isCommand = text.startsWith("/");
+		const name = isCommand ? (space === -1 ? text.slice(1) : text.slice(1, space)) : "";
+		const args = isCommand ? (space === -1 ? "" : text.slice(space + 1).trim()) : "";
+		return {
+			name,
+			args,
+			view: snapshot,
+			cwd: agentOf(snapshot.conversation).cwd ?? snapshot.session.cwd,
+			settings,
+			controller,
+			notice,
+			restoreEditor: () => view.restoreEditor(),
+		};
+	};
+
 	view = new DurableTui(source.current().session.cwd, {
 		submit: (text) => {
 			const trimmed = text.trim();
 			if (!trimmed) return;
+			// Builtins first, exactly as before.
 			if (trimmed === "/model") return selectModel();
 			if (trimmed === "/tasks") return void controller.toggleTasks();
 			if (trimmed === "/agents") return selectConversation();
@@ -629,9 +653,39 @@ export async function runDurableTui(
 				const instructions = trimmed.slice("/compact".length).trim();
 				return void controller.compact(instructions || undefined);
 			}
-			void controller.submit(trimmed, "steer");
+			// DESIGN.md §6.2: registered commands, then panels, then input expanders.
+			const commandCtx = commandContextFor(trimmed);
+			const command = commands.get(commandCtx.name);
+			if (command !== undefined) {
+				void Promise.resolve(command.execute(commandCtx)).catch((error: unknown) =>
+					commandCtx.notice(
+						"error",
+						`Command /${commandCtx.name} failed: ${error instanceof Error ? error.message : String(error)}`,
+					),
+				);
+				return;
+			}
+			const panel = panels.get(commandCtx.name);
+			if (panel !== undefined) {
+				view.mount(panel.build(commandCtx));
+				return;
+			}
+			const expanded = expandInput(trimmed, commandCtx);
+			if (expanded.startsWith("/")) {
+				notice("error", `Unknown command: /${commandCtx.name}`);
+				return;
+			}
+			void controller.submit(expanded, "steer");
 		},
-		followUp: (text) => void controller.submit(text, "followUp"),
+		followUp: (text) => {
+			const trimmed = text.trim();
+			if (!trimmed) return;
+			if (trimmed.startsWith("/")) {
+				notice("error", "Commands cannot be queued as follow-ups");
+				return;
+			}
+			void controller.submit(expandInput(trimmed, commandContextFor(trimmed)), "followUp");
+		},
 		abort: () => void controller.abort(),
 		exit,
 		selectModel,
@@ -644,6 +698,8 @@ export async function runDurableTui(
 		showError: (message) => console.error(message),
 		onChanged: () => view.ui.requestRender(),
 	});
+	// An extension's ctx.shutdown() exits through the same path as Ctrl+D / app.clear.
+	host.setShutdownHandler(exit);
 	const unsubscribe = source.subscribe(() => view.apply(source.current()));
 	view.start();
 	themes.applyFromSettings();
