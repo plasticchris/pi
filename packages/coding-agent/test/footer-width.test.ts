@@ -3,7 +3,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import type { AgentSession } from "../src/core/agent-session.ts";
 import type { ReadonlyFooterDataProvider } from "../src/core/footer-data-provider.ts";
 import { FooterComponent, formatCwdForFooter } from "../src/modes/interactive/components/footer.ts";
-import { initTheme } from "../src/modes/interactive/theme/theme.ts";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
 
 type AssistantUsage = {
@@ -120,6 +120,25 @@ describe("formatCwdForFooter", () => {
 describe("FooterComponent width handling", () => {
 	beforeAll(() => {
 		initTheme(undefined, false);
+	});
+
+	it("renders colored extension statuses and following statuses uniformly dim", () => {
+		const data = createFooterData(1);
+		const text = "Copilot 59,198 left ○ 🐴 ponytail: ⚡ FULL ⚡20 tok/s";
+		const footer = new FooterComponent(createSession({ sessionName: "" }), {
+			...data,
+			getExtensionStatuses: () =>
+				new Map([
+					["copilot-credits", "Copilot 59,198 left"],
+					[
+						"ponytail",
+						`${theme.fg("dim", "○")} 🐴 ${theme.fg("muted", "ponytail: ")}${theme.fg("text", "⚡ FULL")}`,
+					],
+					["tok/s", "⚡20 tok/s"],
+				]),
+		});
+
+		expect(footer.render(200)[2]).toBe(theme.fg("dim", text));
 	});
 
 	it("keeps all lines within width for wide session names", () => {
