@@ -643,48 +643,71 @@ export async function runDurableTui(
 
 	view = new DurableTui(source.current().session.cwd, {
 		submit: (text) => {
-			const trimmed = text.trim();
-			if (!trimmed) return;
-			// Builtins first, exactly as before.
-			if (trimmed === "/model") return selectModel();
-			if (trimmed === "/tasks") return void controller.toggleTasks();
-			if (trimmed === "/agents") return selectConversation();
-			if (trimmed === "/compact" || trimmed.startsWith("/compact ")) {
-				const instructions = trimmed.slice("/compact".length).trim();
-				return void controller.compact(instructions || undefined);
-			}
-			// DESIGN.md §6.2: registered commands, then panels, then input expanders.
-			const commandCtx = commandContextFor(trimmed);
-			const command = commands.get(commandCtx.name);
-			if (command !== undefined) {
-				void Promise.resolve(command.execute(commandCtx)).catch((error: unknown) =>
-					commandCtx.notice(
-						"error",
-						`Command /${commandCtx.name} failed: ${error instanceof Error ? error.message : String(error)}`,
-					),
-				);
-				return;
-			}
-			const panel = panels.get(commandCtx.name);
-			if (panel !== undefined) {
-				view.mount(panel.build(commandCtx));
-				return;
-			}
-			const expanded = expandInput(trimmed, commandCtx);
-			if (expanded.startsWith("/")) {
-				notice("error", `Unknown command: /${commandCtx.name}`);
-				return;
-			}
-			void controller.submit(expanded, "steer");
+			void (async () => {
+				const trimmed = text.trim();
+				if (!trimmed) return;
+				// DESIGN §2.5: the `input` event runs before any dispatch; handlers may
+				// transform the text or handle it.
+				const live = (source.current().conversation.docs["pi.live"] ?? {}) as LiveState;
+				const inputResult = await host.fireInput({
+					type: "input",
+					text: trimmed,
+					source: "interactive",
+					...(live.run === undefined ? {} : { streamingBehavior: "steer" }),
+				});
+				if (inputResult?.action === "handled") return;
+				const inputText = inputResult?.action === "transform" ? inputResult.text : trimmed;
+				// Builtins first, exactly as before.
+				if (inputText === "/model") return selectModel();
+				if (inputText === "/tasks") return void controller.toggleTasks();
+				if (inputText === "/agents") return selectConversation();
+				if (inputText === "/compact" || inputText.startsWith("/compact ")) {
+					const instructions = inputText.slice("/compact".length).trim();
+					return void controller.compact(instructions || undefined);
+				}
+				// DESIGN.md §6.2: registered commands, then panels, then input expanders.
+				const commandCtx = commandContextFor(inputText);
+				const command = commands.get(commandCtx.name);
+				if (command !== undefined) {
+					void Promise.resolve(command.execute(commandCtx)).catch((error: unknown) =>
+						commandCtx.notice(
+							"error",
+							`Command /${commandCtx.name} failed: ${error instanceof Error ? error.message : String(error)}`,
+						),
+					);
+					return;
+				}
+				const panel = panels.get(commandCtx.name);
+				if (panel !== undefined) {
+					view.mount(panel.build(commandCtx));
+					return;
+				}
+				const expanded = expandInput(inputText, commandCtx);
+				if (expanded.startsWith("/")) {
+					notice("error", `Unknown command: /${commandCtx.name}`);
+					return;
+				}
+				void controller.submit(expanded, "steer");
+			})();
 		},
 		followUp: (text) => {
-			const trimmed = text.trim();
-			if (!trimmed) return;
-			if (trimmed.startsWith("/")) {
-				notice("error", "Commands cannot be queued as follow-ups");
-				return;
-			}
-			void controller.submit(expandInput(trimmed, commandContextFor(trimmed)), "followUp");
+			void (async () => {
+				const trimmed = text.trim();
+				if (!trimmed) return;
+				const inputResult = await host.fireInput({
+					type: "input",
+					text: trimmed,
+					source: "interactive",
+					streamingBehavior: "followUp",
+				});
+				if (inputResult?.action === "handled") return;
+				const inputText = inputResult?.action === "transform" ? inputResult.text : trimmed;
+				if (inputText.startsWith("/")) {
+					notice("error", "Commands cannot be queued as follow-ups");
+					return;
+				}
+				void controller.submit(expandInput(inputText, commandContextFor(inputText)), "followUp");
+			})();
 		},
 		abort: () => void controller.abort(),
 		exit,
