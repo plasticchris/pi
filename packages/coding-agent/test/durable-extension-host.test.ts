@@ -2,7 +2,13 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { type Conversation, createRegistry, type Registry, type ToolExecutionApi } from "@earendil-works/pi-durable";
+import {
+	type Conversation,
+	createRegistry,
+	type Harness,
+	type Registry,
+	type ToolExecutionApi,
+} from "@earendil-works/pi-durable";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createEventBus, type EventBus } from "../src/core/event-bus.ts";
 import type { ModelRuntime } from "../src/core/model-runtime.ts";
@@ -144,6 +150,9 @@ describe("durable extension host", () => {
 		return {} as never;
 	});
 	const conversation = { id: 1, submit: submitMock } as unknown as Conversation;
+	// Not a real harness: the S3 event bridge's stream start fails and is noticed, then cleared
+	// per test; the binding just needs the field for type and shape.
+	const harness = {} as unknown as Harness;
 	const controller: DurableController = {
 		submit: vi.fn(async () => {}),
 		compact: vi.fn(async () => {}),
@@ -185,6 +194,7 @@ describe("durable extension host", () => {
 			context: BACKGROUND_CONTEXT,
 			controller,
 			getConversation: async () => conversation,
+			harness,
 		} satisfies ExtensionHostBinding);
 		host = created;
 	});

@@ -360,6 +360,7 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 			context,
 			controller,
 			getConversation: (id) => opened.conversation(id, context),
+			harness: opened,
 		});
 
 		await host.fireSessionStart(location.created ? "startup" : "resume");

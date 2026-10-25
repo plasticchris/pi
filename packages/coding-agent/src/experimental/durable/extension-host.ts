@@ -10,6 +10,7 @@
 
 import type { Context, JsonValue } from "@earendil-works/chord";
 import type {
+	AgentMessage,
 	AgentTool,
 	AgentToolCallOutcome,
 	AgentToolResult,
@@ -25,11 +26,16 @@ import {
 } from "@earendil-works/pi-ai";
 import {
 	type AgentChange,
+	type CompactionHooks,
+	CompactionTask,
 	type Conversation,
 	type ConversationId,
 	type Extension as DurableExtension,
 	defineExtension,
 	type EntryDraft,
+	type Harness,
+	type HookApi,
+	hook,
 	type InboxState,
 	type JsonObject,
 	type LiveState,
@@ -39,6 +45,7 @@ import {
 	type ToolExecutionResult,
 	type ToolRegistration,
 } from "@earendil-works/pi-durable";
+import { extractFileOpsFromMessage, type FileOperations } from "../../core/compaction/utils.ts";
 import { createEventBus, type EventBus } from "../../core/event-bus.ts";
 import type {
 	CompactOptions,
@@ -48,7 +55,11 @@ import type {
 	ExtensionContext,
 	ExtensionToolContext,
 	ExtensionUIContext,
+	InputEvent,
+	InputEventResult,
 	LoadExtensionsResult,
+	SessionBeforeCompactEvent,
+	SessionBeforeCompactResult,
 	ToolDefinition,
 	ToolExposure,
 	ToolInfo,
@@ -61,6 +72,7 @@ import type { Skill } from "../../core/skills.ts";
 import type { SlashCommandInfo } from "../../core/slash-commands.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 import { commands, type DurableCommandContext, expandInput, type NoticeLevel } from "./command-registry.ts";
+import { EventBridge, toSessionEntry, unwrapSummary } from "./event-bridge.ts";
 import { agentOf, type DurableController, type DurableView, type DurableViewSource } from "./runtime.ts";
 import { contextTokens } from "./tui.ts";
 
@@ -91,6 +103,8 @@ export interface ExtensionHostBinding {
 	readonly controller: DurableController;
 	/** Resolve a conversation by ID; used to track switches. */
 	readonly getConversation: (id: ConversationId) => Promise<Conversation | undefined>;
+	/** The durable harness, for the S3 event stream (watchEvents) and compaction receipts. */
+	readonly harness: Harness;
 }
 
 export interface ExtensionHost {
@@ -107,6 +121,10 @@ export interface ExtensionHost {
 	attach(binding: ExtensionHostBinding): void;
 	fireSessionStart(reason: "startup" | "resume"): Promise<void>;
 	fireSessionShutdown(): Promise<void>;
+	/** Fire a mapped pi event through every extension handler (S3 stream bridge, controller wrapper). */
+	fire(event: string, payload: unknown): Promise<void>;
+	/** Run the `input` handlers; a transform chains, the first `handled` wins (DESIGN §2.5). */
+	fireInput(event: InputEvent): Promise<InputEventResult | undefined>;
 	createContext(): ExtensionContext;
 	createCommandContext(): ExtensionCommandContext;
 	/** Build the tool execution context for a bridged tool call. */
@@ -162,6 +180,7 @@ class ExtensionHostImpl implements ExtensionHost {
 	#binding: ExtensionHostBinding | undefined;
 	#conversation: Conversation | undefined;
 	#shutdownHandler: (() => void) | undefined;
+	#bridge: EventBridge | undefined;
 	#closed = false;
 
 	constructor(options: ExtensionHostOptions, loaded: LoadedResources) {
@@ -333,7 +352,12 @@ class ExtensionHostImpl implements ExtensionHost {
 
 	#buildBridge(): DurableExtension {
 		const tools: ToolRegistration[] = [...this.#tools.values()].map((tool) => this.#mapTool(tool));
-		return defineExtension({ name: "pi-bridge", tools });
+		// The pi-bridge extension also carries the S3 event hooks: the durable compaction task's
+		// beforeCompact maps to pi's `session_before_compact` (DESIGN §2.5).
+		const hooks = hook(CompactionTask, {
+			beforeCompact: (compaction, api, context) => this.#beforeCompact(compaction, api, context),
+		});
+		return defineExtension({ name: "pi-bridge", tools, hooks: [hooks] });
 	}
 
 	#mapTool(bridged: BridgedTool): ToolRegistration {
@@ -700,7 +724,7 @@ class ExtensionHostImpl implements ExtensionHost {
 		};
 	}
 
-	// --- Events (S2: session lifecycle; S3 adds the stream bridge) ------------------
+	// --- Events (S2: session lifecycle; S3: the stream bridge in event-bridge.ts) ----------
 
 	async #fire(event: string, payload: unknown): Promise<void> {
 		const ctx = this.createContext();
@@ -720,12 +744,117 @@ class ExtensionHostImpl implements ExtensionHost {
 		}
 	}
 
+	/** Fire a mapped pi event through every extension handler. */
+	async fire(event: string, payload: unknown): Promise<void> {
+		await this.#fire(event, payload);
+	}
+
+	/**
+	 * Run the `input` handlers, as pi's emitInput does: a `transform` chains (later handlers see
+	 * the transformed text), the first `handled` wins, handler errors become notices.
+	 */
+	async fireInput(event: InputEvent): Promise<InputEventResult | undefined> {
+		const ctx = this.createContext();
+		let current: InputEvent = event;
+		for (const extension of this.#extensions) {
+			const handlers = extension.handlers.get("input");
+			if (handlers === undefined) continue;
+			for (const handler of [...handlers]) {
+				let result: InputEventResult | undefined;
+				try {
+					result = (await handler(current, ctx)) as InputEventResult | undefined;
+				} catch (error) {
+					this.#notice(
+						"error",
+						`Extension ${extension.path} event input failed: ${error instanceof Error ? error.message : String(error)}`,
+					);
+					continue;
+				}
+				if (result?.action === "handled") return result;
+				if (result?.action === "transform") {
+					current = {
+						...current,
+						text: result.text,
+						...(result.images === undefined ? {} : { images: result.images }),
+					};
+				}
+			}
+		}
+		return undefined;
+	}
+
 	async fireSessionStart(reason: "startup" | "resume"): Promise<void> {
 		await this.#fire("session_start", { type: "session_start", reason });
 	}
 
 	async fireSessionShutdown(): Promise<void> {
 		await this.#fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+	}
+
+	/**
+	 * The durable compaction task's beforeCompact, mapped to pi's `session_before_compact`
+	 * (DESIGN §2.5). The first `cancel` declines; otherwise the last supplied summary wins and
+	 * replaces the model-generated one.
+	 */
+	async #beforeCompact(
+		compaction: Parameters<CompactionHooks["beforeCompact"]>[0],
+		runtime: HookApi,
+		context: Context,
+	): Promise<{ readonly decline: true } | { readonly summary: string } | undefined> {
+		const view = this.#view();
+		const agentState = agentOf(view.conversation);
+		const modelRef = agentState.model;
+		const model =
+			modelRef === undefined ? undefined : this.#options.modelRuntime.getModel(modelRef.provider, modelRef.modelId);
+		const settings = this.#options.settings.getCompactionSettings(
+			model === undefined ? undefined : { provider: model.provider, id: model.id },
+		);
+		const messages = [...compaction.messages] as AgentMessage[];
+		const fileOps: FileOperations = { read: new Set(), written: new Set(), edited: new Set() };
+		for (const message of messages) extractFileOpsFromMessage(message, fileOps);
+		// The hook's entries are head-marker first: a leading compaction entry is the previous summary.
+		const head = compaction.entries[0];
+		const previousSummary = head !== undefined && head.kind === "pi.compaction" ? unwrapSummary(head) : undefined;
+		const event: SessionBeforeCompactEvent = {
+			type: "session_before_compact",
+			preparation: {
+				firstKeptEntryId: String(compaction.firstKept),
+				messagesToSummarize: messages,
+				turnPrefixMessages: [],
+				isSplitTurn: false,
+				tokensBefore: totalAssistantTokens(messages),
+				...(previousSummary === undefined ? {} : { previousSummary }),
+				fileOps,
+				settings,
+			},
+			branchEntries: compaction.entries.map(toSessionEntry),
+			...(compaction.instructions === undefined ? {} : { customInstructions: compaction.instructions }),
+			reason: compaction.reason,
+			willRetry: compaction.reason === "overflow",
+			signal: context.abortSignal ?? new AbortController().signal,
+		};
+		let summary: string | undefined;
+		for (const extension of this.#extensions) {
+			const handlers = extension.handlers.get("session_before_compact");
+			if (handlers === undefined) continue;
+			for (const handler of [...handlers]) {
+				let result: SessionBeforeCompactResult | undefined;
+				try {
+					result = (await handler(event, this.createContext())) as SessionBeforeCompactResult | undefined;
+				} catch (error) {
+					this.#notice(
+						"error",
+						`Extension ${extension.path} event session_before_compact failed: ${error instanceof Error ? error.message : String(error)}`,
+					);
+					continue;
+				}
+				if (result?.cancel === true) return { decline: true };
+				if (result?.compaction !== undefined) summary = result.compaction.summary;
+			}
+		}
+		if (summary === undefined) return undefined;
+		this.#bridge?.markFromExtension(runtime.taskId);
+		return { summary };
 	}
 
 	// --- Controller wrapper and lifecycle ------------------------------------------
@@ -735,16 +864,40 @@ class ExtensionHostImpl implements ExtensionHost {
 			submit: (text, whenBusy) => controller.submit(text, whenBusy),
 			compact: (instructions) => controller.compact(instructions),
 			abort: () => controller.abort(),
-			cycleThinking: () => controller.cycleThinking(),
-			setModel: (ref) => controller.setModel(ref),
+			// DESIGN §2.5: model_select / thinking_level_select fire around the wrapped calls.
+			cycleThinking: () => {
+				const previousLevel = this.#getThinkingLevel();
+				return controller.cycleThinking().then(() => {
+					void this.#fire("thinking_level_select", {
+						type: "thinking_level_select",
+						level: this.#getThinkingLevel(),
+						previousLevel,
+					});
+				});
+			},
+			setModel: (ref) => {
+				const previousModel = this.#currentModel();
+				return controller.setModel(ref).then(() => {
+					const model = this.#options.modelRuntime.getModel(ref.provider, ref.modelId);
+					if (model !== undefined)
+						void this.#fire("model_select", {
+							type: "model_select",
+							model,
+							previousModel,
+							source: "set" as const,
+						});
+				});
+			},
 			toggleTasks: () => controller.toggleTasks(),
-			// Track the shown conversation after the inner switch commits.
+			// Track the shown conversation after the inner switch commits; re-subscribe the event stream.
 			switchConversation: (id) =>
 				controller.switchConversation(id).then(() =>
 					this.#binding
 						?.getConversation(id)
 						.then((conversation) => {
-							if (conversation !== undefined) this.#conversation = conversation;
+							if (conversation === undefined) return;
+							this.#conversation = conversation;
+							void this.#bridge?.switchTo(id).catch(() => {});
 						})
 						.catch(() => {}),
 				),
@@ -754,6 +907,16 @@ class ExtensionHostImpl implements ExtensionHost {
 	attach(binding: ExtensionHostBinding): void {
 		this.#binding = binding;
 		this.#conversation = binding.conversation;
+		// S3 event bridge: map the current conversation's watchEvents stream to pi events.
+		this.#bridge = new EventBridge({
+			harness: binding.harness,
+			context: binding.context,
+			dispatch: (event) => this.#fire(event.type, event),
+			notice: (level, message) => this.#notice(level, message),
+		});
+		void this.#bridge
+			.start(binding.conversation.id)
+			.catch((error) => this.#notice("warning", error instanceof Error ? error.message : String(error)));
 	}
 
 	setShutdownHandler(handler: () => void): void {
@@ -763,6 +926,9 @@ class ExtensionHostImpl implements ExtensionHost {
 	async close(): Promise<void> {
 		if (this.#closed) return;
 		this.#closed = true;
+		// The event stream is a harness attachment: stop it before the harness closes.
+		await this.#bridge?.stop().catch(() => {});
+		this.#bridge = undefined;
 		await this.fireSessionShutdown();
 	}
 
@@ -822,6 +988,18 @@ function textOfContent(content: string | (TextContent | ImageContent)[]): string
 		text += block.text;
 	}
 	return text;
+}
+
+/** Context-token approximation for `session_before_compact.preparation.tokensBefore`: the
+ * summed usage of the assistant messages about to be summarized. */
+function totalAssistantTokens(messages: readonly AgentMessage[]): number {
+	let total = 0;
+	for (const message of messages) {
+		if (message.role !== "assistant") continue;
+		const usage = message.usage;
+		total += usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+	}
+	return total;
 }
 
 /** First word of a `/command args` text, for name/args parsing. */
