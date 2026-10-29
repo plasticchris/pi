@@ -348,14 +348,20 @@ function onAssistantEntry(state: BridgeState, events: ExtensionEvent[], seen: Se
 	state.partial = undefined;
 	if (partial !== undefined) events.push({ type: "message_end", message: assistant });
 	const turn = state.turn;
-	if (turn !== undefined && turn.entryId === entry.id) {
-		// This entry opened the turn (via a partial we saw); settle it.
-		state.turn = { ...turn, message: assistant, calls, args: new Map(toolCalls.map((c) => [c.id, c.arguments])) };
-	} else if (turn === undefined || turn.entryId !== -1) {
-		// The partial was never seen (attach mid-turn) or a different round was open:
-		// settle the open round, then open this entry's turn.
+	if (turn !== undefined && (turn.entryId === entry.id || turn.entryId === -1)) {
+		// This entry is the round we track: it opened the turn from a partial (sentinel
+		// entryId -1) or was already recorded for it. Settle the committed message on it.
+		state.turn = {
+			...turn,
+			entryId: entry.id,
+			message: assistant,
+			calls,
+			args: new Map(toolCalls.map((c) => [c.id, c.arguments])),
+		};
+	} else {
+		// No round is open, or a different committed round is: settle the open round, then
+		// open this entry's turn (attach mid-turn, or a partial we never saw).
 		if (turn !== undefined) endOpenTurn(state, events, outcomeOfTurn(turn.message));
-		state.turnIndex += 1;
 		state.turn = {
 			index: state.turnIndex,
 			entryId: entry.id,
@@ -364,9 +370,10 @@ function onAssistantEntry(state: BridgeState, events: ExtensionEvent[], seen: Se
 			args: new Map(toolCalls.map((c) => [c.id, c.arguments])),
 			results: new Map(),
 		};
+		state.turnIndex += 1;
 		if (calls.length > 0) events.push({ type: "turn_start", turnIndex: state.turn.index, timestamp: Date.now() });
 	}
-	// A text-only answer closes a turn it opened.
+	// A text-only answer closes the turn it opened.
 	if (calls.length === 0 && state.turn !== undefined && state.turn.entryId === entry.id) {
 		endOpenTurn(state, events, outcomeOfTurn(state.turn.message));
 	}
@@ -443,7 +450,6 @@ function applyGeneration(state: BridgeState, events: ExtensionEvent[], live: Liv
 	if (state.partial === undefined) {
 		state.partial = partial;
 		if (state.turn === undefined) {
-			state.turnIndex += 1;
 			state.turn = {
 				index: state.turnIndex,
 				entryId: -1,
@@ -453,6 +459,7 @@ function applyGeneration(state: BridgeState, events: ExtensionEvent[], live: Liv
 				results: new Map(),
 			};
 			events.push({ type: "turn_start", turnIndex: state.turn.index, timestamp: Date.now() });
+			state.turnIndex += 1;
 		}
 		events.push({ type: "message_start", message: partial });
 		return;

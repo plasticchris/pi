@@ -36,7 +36,15 @@ Simplifications the 1.4.0 surface forces (capabilities cut or coarsened, each no
   `TurnEndEvent.entries`/`context` are `[]`/empty previews and `continue` is always `false`;
   `outcome` is derived from the assistant `stopReason` / run failure. `messageEntryId`/`toolResultEntryIds`
   are `String(entryId)` of the durable entries (or `"0"` when the turn opened from a partial the
-  bridge never saw commit).
+  bridge never saw commit). `turnIndex` is 0-based, matching pi's `agent-session.ts` (`_turnIndex` starts
+  at 0).
+- **A tool round committed inside one delivered view emits its tool events after `turn_end`.** The
+  bridge maps committed entries first (which can settle the turn) and the live slots second; for a round
+  whose assistant + result entries and done slots land in the same throttled view, the `turn_end` is
+  dispatched before the `tool_execution_start`/`end` for that round. Live (mid-round) rounds are unaffected —
+  slots are observed before the committed assistant settles them, so tool events precede `turn_end`. pi
+  extensions are not contractually ordered across these, and the TUI renders from committed state, not
+  these events.
 - **Tool args are reconstructed.** 1.4.0 `ToolSlot` carries no arguments: top-level start/update/end
   events echo the args parsed from the turn's committed `pi.assistant` `ToolCall` blocks (`null`
   when absent); nested calls use `NestedToolSlot.arguments` directly, with `parentCallId`/`parentTaskId`
