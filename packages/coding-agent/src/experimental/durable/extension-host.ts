@@ -897,7 +897,7 @@ class ExtensionHostImpl implements ExtensionHost {
 						.then((conversation) => {
 							if (conversation === undefined) return;
 							this.#conversation = conversation;
-							void this.#bridge?.switchTo(id).catch(() => {});
+							void this.#bridge?.switchTo(conversation).catch(() => {});
 						})
 						.catch(() => {}),
 				),
@@ -907,15 +907,14 @@ class ExtensionHostImpl implements ExtensionHost {
 	attach(binding: ExtensionHostBinding): void {
 		this.#binding = binding;
 		this.#conversation = binding.conversation;
-		// S3 event bridge: map the current conversation's watchEvents stream to pi events.
+		// S3 event bridge: map the current conversation's watch stream to pi events.
 		this.#bridge = new EventBridge({
-			harness: binding.harness,
 			context: binding.context,
 			dispatch: (event) => this.#fire(event.type, event),
 			notice: (level, message) => this.#notice(level, message),
 		});
 		void this.#bridge
-			.start(binding.conversation.id)
+			.start(binding.conversation)
 			.catch((error) => this.#notice("warning", error instanceof Error ? error.message : String(error)));
 	}
 

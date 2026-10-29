@@ -1,4 +1,3 @@
-import type { AttachedReplicatedState } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { clampThinkingLevel, getSupportedThinkingLevels, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import {
@@ -6,6 +5,7 @@ import {
 	type Conversation,
 	type ConversationId,
 	type ConversationView,
+	type ConversationWatch,
 	type Cursor,
 	type EntryRecord,
 	Harness,
@@ -188,7 +188,7 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 			cursor = page.next;
 		} while (cursor !== undefined);
 		let current: Conversation = root;
-		let conversation: AttachedReplicatedState<ConversationView> = await root.viewState(context);
+		let conversation: ConversationWatch = await root.watch(context);
 		const models = (): ModelSummary[] =>
 			modelRuntime.getAvailableSnapshot().map((model) => ({
 				provider: model.provider,
@@ -225,28 +225,41 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 		const fail = (error: unknown): void => notice("error", error instanceof Error ? error.message : String(error));
 		report = (error) => notice("warning", error instanceof Error ? error.message : String(error));
 		for (const error of pendingReports) report(error);
-		let unsubscribe = conversation.subscribe((value) => update({ conversation: value }));
-		// Subagents appear as their conversations are created. A commit listener only records; it calls no Session API.
-		const unsubscribeCommits = harness.subscribeCommits((publication) => {
-			let conversations = state.conversations;
-			for (const change of publication.changes) {
-				if (change.type === "conversation") {
-					conversations = [...conversations, { id: change.value.id, label: label(change.value.id) }];
-				} else if (change.type === "entry" && change.value.kind === "pi.user") {
-					const id = change.value.conversationId;
-					conversations = conversations.map((summary) =>
-						summary.id === id && summary.title === undefined ? { ...summary, ...titleOf(change.value) } : summary,
-					);
-				}
-			}
-			if (conversations !== state.conversations) update({ conversations });
+		let unsubscribe = (): void => {};
+		unsubscribe = () => {
+			void conversation.stop().catch(() => {});
+		};
+		conversation.start((call) => {
+			if (call.kind === "value") update({ conversation: call.value });
+			return Promise.resolve();
 		});
+		// Subagents appear as their conversations are created. A commit listener only records; it calls no Session API.
+		const commitObservation = harness.observeCommits({
+			advance: (publication, ctx) => {
+				let conversations = state.conversations;
+				for (const change of publication.changes) {
+					if (change.type === "conversation") {
+						conversations = [...conversations, { id: change.value.id, label: label(change.value.id) }];
+					} else if (change.type === "entry" && change.value.kind === "pi.user") {
+						const id = change.value.conversationId;
+						conversations = conversations.map((summary) =>
+							summary.id === id && summary.title === undefined
+								? { ...summary, ...titleOf(change.value) }
+								: summary,
+						);
+					}
+				}
+				if (conversations !== state.conversations) update({ conversations });
+				void ctx;
+			},
+			end: () => {},
+		});
+		const unsubscribeCommits = (): void => commitObservation.detach();
 
-		let tasks: AttachedReplicatedState<TaskGraph> | undefined;
+		let tasks: TaskGraph | undefined;
 		let unsubscribeTasks = (): void => {};
 		const closeTasks = (): void => {
 			unsubscribeTasks();
-			tasks?.dispose();
 			tasks = undefined;
 		};
 
@@ -329,20 +342,33 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 						update({ tasks: undefined });
 						return;
 					}
-					const graph = await opened.taskGraph(context);
-					tasks = graph;
-					unsubscribeTasks = graph.subscribe((value) => update({ tasks: value }));
+					const graph = await opened.watchTaskGraph(context);
+					tasks = graph.value;
+					update({ tasks });
+					unsubscribeTasks = () => {
+						void graph.stop().catch(() => {});
+					};
+					graph.start((call) => {
+						if (call.kind === "value") update({ tasks: call.value });
+						return Promise.resolve();
+					});
 				}),
 			switchConversation: (id) =>
 				command(async () => {
 					const next = await opened.conversation(id, context);
 					if (next === undefined) throw new Error(`Conversation ${id} does not exist`);
-					const nextState = await next.viewState(context);
+					const nextWatch = await next.watch(context);
 					unsubscribe();
-					conversation.dispose();
 					current = next;
-					conversation = nextState;
-					unsubscribe = nextState.subscribe((value) => update({ conversation: value }));
+					conversation = nextWatch;
+					update({ conversation: nextWatch.value });
+					unsubscribe = () => {
+						void nextWatch.stop().catch(() => {});
+					};
+					nextWatch.start((call) => {
+						if (call.kind === "value") update({ conversation: call.value });
+						return Promise.resolve();
+					});
 				}),
 		};
 
@@ -386,7 +412,7 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 				closing ??= (async () => {
 					unsubscribe();
 					unsubscribeCommits();
-					conversation.dispose();
+					await conversation.stop().catch(() => {});
 					closeTasks();
 					// Fires session_shutdown before the harness closes.
 					await host.close();

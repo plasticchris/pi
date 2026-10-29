@@ -5,13 +5,59 @@ like regular pi for everything that maps onto the durable Harness. This document
 for the three campaign tracks; section 6 (Integration Seams) is binding and verbatim for the
 `sibling` tracks (durable-parity-ui, durable-parity-templates).
 
-**No pi-durable changes are needed** (verified): `watchEvents(harness, conversationId, context)`
-(`packages/durable/src/harness/events.ts`, exported from `@earendil-works/pi-durable`) provides the
-per-turn lifecycle stream (`AgentEvent`: `turn_start`/`turn_end`, `message_*`, `tool_execution_*`,
-`compaction_start`/`compaction_end`, `auto_retry_start`/`auto_retry_end`, `agent_changed`,
-`submission`, `inbox_update`, ...), and durable extensions can hook built-in tasks
+**No pi-durable changes are needed** (verified): `conversation.watch(context)`
+(`packages/durable/src/harness/view.ts`, exported from `@earendil-works/pi-durable`) delivers the
+throttled `ConversationView` — the committed transcript window plus built-in documents, the live
+projection at `docs["pi.live"]` — from which the bridge derives the per-turn lifecycle (`turn_*`,
+`message_*`, `tool_execution_*`, compaction events), and durable extensions can hook built-in tasks
 (`CompactionHooks.beforeCompact` on `pi.compaction`, `ToolHooks` on `pi.tool`, `GenerationHooks` on
 `pi.generation`). All bridge code lives in the demo directory.
+
+## 0. Port to pi-durable 1.4.0 (old → new API mapping)
+
+The 1.4.0 release removed the dedicated event-stream surface this demo was written against. The
+mapping actually implemented (see `event-bridge.ts`, `runtime.ts`, `tui.ts`):
+
+| 1.3.0 API (removed) | 1.4.0 replacement used by the demo |
+|---|---|
+| `watchEvents(harness, conversationId, context)` → `AgentEvent` stream | `conversation.watch(context)` → `ConversationWatch`; the bridge diffs consecutive `ConversationView`s (committed entries + `docs["pi.live"]`) into pi events |
+| `Conversation.viewState` | seed from `watch.value`; no standalone state read |
+| `Harness.taskGraph` | `harness.watchTaskGraph(context)` → `TaskGraphWatch` (task panel) |
+| `Harness.subscribeCommits` | `harness.observeCommits(observer: CommitObserver)` (conversation labels/titles only) |
+| `CompactionStatus.reason` / `CompactionFailure.reason` | `.trigger` (`CompactionReason`) |
+| `EntryRecord.timestamp` (removed from the type) | synthesized: committed messages keep the pi message's own timestamp; compaction/custom entries get `Date.now()`; `CompactionEntry.timestamp` is the epoch placeholder `1970-01-01` (no wall clock survives to the demo) |
+
+Simplifications the 1.4.0 surface forces (capabilities cut or coarsened, each noted where used):
+
+- **Token-level streaming is gone.** 1.4.0 only exposes the *committed, throttled* partial in
+  `LiveState.generation.message`. `message_update` is therefore a coarse `text_delta` with an empty
+  `delta` whose `partial` carries the current text; the first partial appearance is `message_start`.
+- **`turn_end` boundary state is empty.** The demo has no session-file projection, so
+  `TurnEndEvent.entries`/`context` are `[]`/empty previews and `continue` is always `false`;
+  `outcome` is derived from the assistant `stopReason` / run failure. `messageEntryId`/`toolResultEntryIds`
+  are `String(entryId)` of the durable entries (or `"0"` when the turn opened from a partial the
+  bridge never saw commit).
+- **Tool args are reconstructed.** 1.4.0 `ToolSlot` carries no arguments: top-level start/update/end
+  events echo the args parsed from the turn's committed `pi.assistant` `ToolCall` blocks (`null`
+  when absent); nested calls use `NestedToolSlot.arguments` directly, with `parentCallId`/`parentTaskId`
+  mapping to `parentToolCallId`.
+- **Tool results prefer the committed entry.** A `done` slot's `entry` pointer finds its
+  `pi.tool-result` entry (real `isError`/`durationMs`); without one the bridge synthesizes a text
+  result from the slot's retained output. Nested ends use `NestedToolSlot.summary`.
+- **Compaction bookkeeping is best-effort.** Success: the committed `pi.compaction` entry is
+  authoritative — `reason` from `entry.data.reason` (default `manual`), `firstKeptEntryId` from
+  `entry.head` (else `"0"`), `tokensBefore: 0` (unknown to the demo), `usage` omitted. Failure:
+  `live.compactionFailure` fires `session_compact_failed` once its task leaves `live.compactions`;
+  `reason` from `failure.trigger`, `errorMessage` from `failure.error`. `fromExtension` correlates
+  via `markFromExtension(taskId)` (the `session_before_compact` handler's task) and the entry's
+  `byTaskId`; tasks with neither marker default to `false`. `session_compact` sets
+  `willRetry: reason === "overflow"`.
+- **Cut entirely (no clean 1.4.0 equivalent):** `AgentEvent` `submission`, `auto_retry_start/end`,
+  `agent_changed`, `compaction_start` (no distinct start event; the live `CompactionStatus` list is
+  observed but only used to scope the failure dedupe), `inbox_update` (inbox is harness-internal),
+  fine-grained commit-list events (only conversation metadata flows through `observeCommits`).
+- **The watch listener never throws** (a throw ends the watch); delivery failures surface as
+  warning notices, and a superseded watch is epoch-guarded so stale views drop on `switchTo`/`stop`.
 
 ## 1. Architecture
 
@@ -184,19 +230,20 @@ data; fields the demo cannot know are omitted or approximated (noted).
 | `session_start` | `host.fireSessionStart()` after open (S2) | `reason`: `"startup"` (new session) / `"resume"` (`--continue`) |
 | `session_shutdown` | `host.close()` in `durable.close()`, before `harness.close()` (S2) | `reason: "quit"` |
 | `input` | TUI submit path, before command/panel/expander dispatch (S3) | result `continue`/`transform`/`handled` honored as in pi |
-| `turn_start`, `turn_end` | `watchEvents` `AgentEvent` stream (S3) | `turnIndex` = per-conversation counter from 0; `timestamp = Date.now()`; `turn_end.message`/`toolResults`/entry ids from the turn's entries (ids as `String(entryId)`) |
-| `message_start`, `message_update`, `message_end` | stream (S3) | `message_update.message` = the live partial (`pi.live.generation.message`) — the stream carries `changes` deltas, the demo reassembles from the partial |
-| `tool_execution_start`, `tool_execution_update`, `tool_execution_end` | stream (S3) | `toolCallId`/`toolName`/`parentToolCallId` faithful; `end.result` from the result entry |
+| `turn_start`, `turn_end` | `conversation.watch` view diff (S3) | `turnIndex` = per-conversation counter from 0; `timestamp = Date.now()`; `turn_end.message`/`toolResults`/entry ids from the turn's entries (ids as `String(entryId)`); boundary state empty — see §0 |
+| `message_start`, `message_update`, `message_end` | `conversation.watch` view diff (S3) | `message_update.message` = the live partial (`pi.live.generation.message`); 1.4.0 only exposes the throttled partial, so `message_update` is a coarse `text_delta` — see §0 |
+| `tool_execution_start`, `tool_execution_update`, `tool_execution_end` | `conversation.watch` view diff (S3) | `toolCallId`/`toolName`/`parentToolCallId` faithful; args reconstructed (1.4.0 slots carry none); `end.result` from the committed `pi.tool-result` entry or the slot's retained output — see §0 |
 | `model_select`, `thinking_level_select` | `host.wrapController` around `setModel`/`cycleThinking` (S3) | `source: "set"` |
 | `session_before_compact` | bridge durable extension hook `CompactionHooks.beforeCompact` on task `pi.compaction` (S3) | **honored**: handler `decline`/`summary` results map to the hook's `{ decline: true }` / `{ summary }`; payload `preparation`/`branchEntries` are best-effort from the hook's `compaction` argument (`reason`, `entries` → `branchEntries`-shaped) |
-| `session_compact`, `session_compact_failed` | stream `compaction_end` + the `controller.compact` task receipt (S3) | `reason` faithful; `aborted` from the receipt outcome; `fromExtension` from whether a before-compact summary was used |
+| `session_compact`, `session_compact_failed` | committed `pi.compaction` entry / `pi.live.compactionFailure` (S3) | `reason` from `entry.data.reason` / `failure.trigger` (1.4.0 `trigger`, was `reason`); `fromExtension` via `markFromExtension(taskId)` + entry `byTaskId`; `tokensBefore: 0`, `usage` omitted — see §0 |
 | `auto_retry_start` / `auto_retry_end` (durable) | **not mapped** — pi has no retry event | the TUI status line already shows retries; noted here per the S3 spec |
 | UNSUPPORTED — load-time `warning` notice each, never fired: | `project_trust`, `resources_discover`, `session_info_changed`, `session_before_switch`, `session_before_fork`, `session_before_tree`, `session_tree`, `mcp_servers_change`, `context`, `context_with_system`, `cache_warming_decision`, `before_provider_request`, `before_provider_headers`, `after_provider_response`, `provider_stream_event`, `before_agent_start`, `agent_start`, `agent_end`, `agent_before_settle`, `agent_settled`, `ui_prompt_start`, `ui_prompt_end`, `tool_call`, `tool_result`, `user_bash` | reasons: session files/trees and the project-trust prompt don't exist in the demo; the harness does not expose the provider request pipeline (a `context` mapping via `GenerationHooks.beforeRequest` is a possible follow-up); `tool_call`/`tool_result` would map to durable `ToolHooks` (follow-up); no `!`/`!!` user-bash prefix in the demo TUI |
 
 The S3 event bridge lives in a new core file `event-bridge.ts` (created in S3): it subscribes
-`watchEvents` for the current conversation (re-subscribes on `switchConversation` via the controller
-wrapper) and maps stream events → pi events, calling the stored handlers with a host-built
-`ExtensionContext`. Handler throws become `error` notices `Extension <path> event <event> failed: <message>`.
+`conversation.watch(context)` for the current conversation (re-subscribes on `switchConversation` via
+the controller wrapper; a missing/failed `watch` degrades to a `warning` notice) and maps the view
+diff → pi events, calling the stored handlers with a host-built `ExtensionContext`. Handler throws
+become `error` notices `Extension <path> event <event> failed: <message>`.
 
 ## 3. (b) File layout (all three tracks)
 
