@@ -78,7 +78,8 @@ const BUDGETS = {
 			],
 		},
 		// The file tools reach their environment helpers and the Harness definitions they need, not the Harness itself.
-		"./tools": { maxFiles: 17, forbid: ["packages/durable/src/images/"] },
+		// score.ts (2026-11-07) is a fifth tool in the set: same env/helpers, one more file.
+		"./tools": { maxFiles: 18, forbid: ["packages/durable/src/images/"] },
 	},
 };
 

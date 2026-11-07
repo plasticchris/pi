@@ -29,6 +29,8 @@ import {
 	type BeforeToolCallResult,
 	type PrepareNextTurnContext,
 	runToolCall,
+	type SelfImprovementSummary,
+	SelfImprovementTracker,
 	type StreamFn,
 	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
@@ -508,6 +510,12 @@ export class AgentSession {
 	private _toolDefinitions: Map<string, ToolDefinitionEntry> = new Map();
 	private _toolPromptSnippets: Map<string, string> = new Map();
 	private _toolPromptGuidelines: Map<string, string[]> = new Map();
+	/**
+	 * Test-time self-improvement curve for the current task: folds `score` tool
+	 * results into a best-so-far sequence and T* (productive rounds). Reset at
+	 * each user turn so the curve measures one task, not the whole session.
+	 */
+	private _selfImprovement = new SelfImprovementTracker();
 
 	private _baseSystemPromptOptions!: NormalizedBuildSystemPromptOptions;
 	/** Prompt options after before_agent_start mutations for the active run. */
@@ -1390,6 +1398,26 @@ export class AgentSession {
 				this._nestedToolCalls.clear();
 			}
 		}
+		// Test-time self-improvement: a new user turn starts a fresh task curve, and each
+		// `score` tool result extends it. Non-score results are ignored by the tracker.
+		if (event.type === "message_start" && event.message.role === "user") {
+			this._selfImprovement.reset();
+		} else if (event.type === "message_end" && event.message.role === "toolResult") {
+			this._selfImprovement.observe({
+				toolName: event.message.toolName,
+				toolCallId: event.message.toolCallId,
+				details: event.message.details,
+			});
+		}
+		// Log the task's self-improvement curve when a run settles with scored rounds.
+		if (event.type === "agent_end") {
+			const si = this._selfImprovement.summary();
+			if (si.rounds > 0) {
+				console.error(
+					`[self-improvement] rounds=${si.rounds} best=${si.best} productive(T*)=${si.productiveRounds}`,
+				);
+			}
+		}
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
@@ -1779,6 +1807,14 @@ export class AgentSession {
 	/** Get the names of the tools that tools can call through `ctx.executeTool()`. */
 	getCallableToolNames(): string[] {
 		return this._getCallableTools().map((t) => t.name);
+	}
+
+	/**
+	 * Test-time self-improvement curve for the current task: best-so-far score
+	 * per `score` tool round and T* (productive rounds). Reset at each user turn.
+	 */
+	getSelfImprovement(): SelfImprovementSummary {
+		return this._selfImprovement.summary();
 	}
 
 	/**

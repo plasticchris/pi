@@ -2,6 +2,7 @@ import { defineExtension } from "../harness/define.ts";
 import { createBashTool } from "./bash.ts";
 import { createEditTool } from "./edit.ts";
 import { createReadTool, type ReadToolOptions } from "./read.ts";
+import { createScoreTool } from "./score.ts";
 import { createWriteTool } from "./write.ts";
 
 export {
@@ -22,6 +23,7 @@ export {
 	type PreparedImage,
 } from "./image-processor.ts";
 export { createReadTool, type ReadToolDetails, type ReadToolInput, type ReadToolOptions } from "./read.ts";
+export { createScoreTool, type ScoreStructuredOutput, type ScoreToolDetails } from "./score.ts";
 export { createWriteTool, type WriteToolInput } from "./write.ts";
 
 /**
@@ -31,7 +33,7 @@ export { createWriteTool, type WriteToolInput } from "./write.ts";
 export function createCodingTools(options: ReadToolOptions = {}) {
 	return defineExtension({
 		name: "coding-tools",
-		tools: [createReadTool(options), createWriteTool(), createEditTool(), createBashTool()],
+		tools: [createReadTool(options), createWriteTool(), createEditTool(), createBashTool(), createScoreTool()],
 	});
 }
 
