@@ -137,13 +137,30 @@ and valid processes (failures included), not (state, action, reward) tuples.
   tool_call id). ~15 MB with thinking stripped.
 - Documented in `pi-packages/forge/USAGE.md` (shell section).
 
+## Prompt-side iteration rules retired (2026-11-07)
+
+The architectural point of the score boundary is that the harness stops
+*driving* the loop from prompts. So the global AGENTS.md `## Keep going`
+section ("don't stop to summarize", "re-state goal + remaining steps each
+turn", "diagnose or try an alternative first") was replaced with a
+measurement-oriented `## Iteration` note: the model drives its own loop
+(trained meta-skill), use the `score` tool at round boundaries when a
+verifier exists, harness logs the T* curve instead of narrating. Kept:
+verified-completion standard + stop-only-when-blocked. Takes effect for new
+sessions (AGENTS.md is read at session start; the editing session keeps its
+loaded copy).
+
+Checked the other prompt surfaces for loop-driving language:
+- pi-core system prompt (`system-prompt.ts`): none.
+- forge preamble: already measurement-oriented (score-tool guidance).
+- box AGENTS.md: no general loop rules (the 27b read-loop note is a
+  specific failure-mode diagnostic, not a general iteration rule — kept).
+
 ## Not done (follow-ups)
-- Retiring prompt-side iteration rules (AGENTS.md "keep going") now that the
-  model carries them — candidate experiment.
-- Commit the pi-src + pi-durable-mw + forge changes (left uncommitted for
-  review).
 - Actually fine-tune on harvested trajectories (needs a training setup;
   the export is ready for it).
+- A/B the retired rules if premature-stopping shows up (the E2E already
+  showed AREX-2 self-iterating 6 rounds without prompt-side pushing).
 
 ## Files
 - packages/agent/src/self-improvement.ts (new)
